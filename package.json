@@ -1,0 +1,10 @@
+{
+  "name": "ccx-loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Automated dev loop with Codex review gates for Claude Code.",
+  "license": "MIT",
+  "author": {
+    "name": "will"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "ccx-loop",
+  "owner": {
+    "name": "will"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for automated dev loops with Codex review gates.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "ccx-loop",
+      "description": "Automated dev loop: implement, codex review, fix, re-review, handoff, commit",
+      "version": "0.1.0",
+      "source": "./plugins/ccx-loop"
+    }
+  ]
+}

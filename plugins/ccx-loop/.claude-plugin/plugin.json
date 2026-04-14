@@ -1,0 +1,8 @@
+{
+  "name": "ccx-loop",
+  "version": "0.1.0",
+  "description": "Automated dev loop: implement, codex review, fix, re-review, handoff, commit",
+  "author": {
+    "name": "will"
+  }
+}
