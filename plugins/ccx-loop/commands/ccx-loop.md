@@ -42,7 +42,7 @@ Examples:
 - You MUST actually call the Bash tool to run the review command. Never fabricate review output.
 - You MUST actually call Edit/Write tools to fix findings. Never claim a fix without editing the file.
 - After each fix phase, run `git diff --stat` and print the output so the user can see exactly which files changed.
-- Print the raw review JSON verdict and finding count at each cycle: `Review {i}/{N}: verdict={verdict}, findings={count}`
+- Print the raw review JSON verdict and finding count at each cycle. Format: `Review {i}/{N}: verdict={verdict}, findings={count}` in fixed-N mode, or `Review {i}/≤20: verdict={verdict}, findings={count}` in until-approval mode.
 - If the review command fails (non-zero exit, no JSON output, or CODEX_ROOT not found), STOP and report the error to the user. Do not proceed with fabricated results.
 
 ---

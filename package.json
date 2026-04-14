@@ -5,6 +5,21 @@
   "description": "Automated dev loop with Codex review gates for Claude Code.",
   "license": "MIT",
   "author": {
-    "name": "will"
-  }
+    "name": "Will Kang"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/willysk73/ccx-loop.git"
+  },
+  "homepage": "https://github.com/willysk73/ccx-loop#readme",
+  "bugs": {
+    "url": "https://github.com/willysk73/ccx-loop/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "codex",
+    "code-review",
+    "dev-loop"
+  ]
 }

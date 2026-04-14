@@ -1,11 +1,14 @@
 {
   "name": "ccx-loop",
   "owner": {
-    "name": "will"
+    "name": "Will Kang"
   },
   "metadata": {
     "description": "Claude Code plugin for automated dev loops with Codex review gates.",
-    "version": "0.1.0"
+    "version": "0.1.0",
+    "homepage": "https://github.com/willysk73/ccx-loop",
+    "repository": "https://github.com/willysk73/ccx-loop",
+    "license": "MIT"
   },
   "plugins": [
     {
