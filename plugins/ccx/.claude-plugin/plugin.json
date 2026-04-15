@@ -1,7 +1,7 @@
 {
-  "name": "ccx-loop",
-  "version": "0.1.0",
-  "description": "Automated dev loop: implement, codex review, fix, re-review, handoff, commit",
+  "name": "ccx",
+  "version": "0.2.0",
+  "description": "Automated dev loops with Codex review gates. Provides /ccx:loop (fixed N cycles) and /ccx:forever (loop until approval).",
   "author": {
     "name": "Will Kang"
   },
