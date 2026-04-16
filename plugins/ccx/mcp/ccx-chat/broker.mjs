@@ -407,7 +407,10 @@ async function main() {
       assertLive(sessionId);
       const session = registry.get(sessionId);
       if (!session) throw new Error(`unknown session ${sessionId}`);
-      const ids = await adapter.sendTo(session.channelId, `\`#${session.id}\` ${text}`);
+      const prefix = session.branch
+        ? `\`#${session.id}\` \`${session.branch}\``
+        : `\`#${session.id}\``;
+      const ids = await adapter.sendTo(session.channelId, `${prefix} ${text}`);
       for (const id of ids) messageToSession.set(id, session.id);
       return { messageIds: ids };
     },

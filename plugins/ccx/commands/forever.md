@@ -45,7 +45,13 @@ Examples:
 - You MUST actually call the Bash tool to run the review command. Never fabricate review output.
 - You MUST actually call Edit/Write tools to fix findings. Never claim a fix without editing the file.
 - After each fix phase, run `git diff --stat` and print the output so the user can see exactly which files changed.
-- Print a structured cycle summary: `Review {i}/≤{cap}: verdict={verdict}, findings={total} (in-scope={inScope}, skipped={skipped}, fixed={fixed}, unresolved={unresolved})`. When `CHAT_SESSION_ID` is set, also call `chat_send` with the same summary string, and `chat_set_phase` with `review {i}/≤{cap}` at cycle start and `fix {i}/≤{cap}` before Step C (skip the phase update if Step C is skipped).
+- Print a structured cycle summary using this multi-line bullet form (easier to scan in Discord than a comma-packed one-liner):
+  ```
+  Review {i}/≤{cap} — {verdict}
+  • findings: {total} ({inScope} in-scope, {skipped} skipped)
+  • fixed: {fixed} · unresolved: {unresolved}
+  ```
+  When `CHAT_SESSION_ID` is set, also call `chat_send` with the same multi-line block (pass it as a single `text` argument with `\n` between lines — Discord renders each line separately), and `chat_set_phase` with `review {i}/≤{cap}` at cycle start and `fix {i}/≤{cap}` before Step C (skip the phase update if Step C is skipped). Any additional one-line commentary (e.g. what was fixed, test counts) SHOULD be appended as extra `• ` bullets on following lines, not packed onto the same line — the whole point is one fact per bullet.
 - If the review command fails (non-zero exit, no JSON output, or `CODEX_ROOT` not found), STOP and report to the user. Never proceed with fabricated results.
 - **Fix verification:** after each Edit/Write, treat a tool error (file missing, `old_string` not unique, etc.) as `unresolved` — record it, surface it in the cycle summary, and do not silently absorb it.
 
