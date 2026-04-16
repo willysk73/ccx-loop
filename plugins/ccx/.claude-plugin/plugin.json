@@ -1,6 +1,6 @@
 {
   "name": "ccx",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Automated dev loops with Codex review gates. Provides /ccx:loop, /ccx:forever, and an optional Discord chat bridge (/ccx:chat-setup + --chat).",
   "author": {
     "name": "Will Kang"
