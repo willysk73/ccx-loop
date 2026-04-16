@@ -51,6 +51,7 @@ export class Registry {
         channelId: s.channelId,
         createdAt: s.createdAt,
         phase: s.phase,
+        color: s.color ?? null,
       })),
       focus: Object.fromEntries(this.focusByChannel),
       cancelled: [...this.cancelled.entries()].map(([id, v]) => ({
@@ -84,7 +85,7 @@ export class Registry {
     throw new Error('exhausted session id space');
   }
 
-  register({ label, cwd, branch, channelId }, { exclude } = {}) {
+  register({ label, cwd, branch, channelId, color }, { exclude } = {}) {
     const id = this.createId({ exclude });
     const session = {
       id,
@@ -92,6 +93,7 @@ export class Registry {
       cwd: cwd ?? null,
       branch: branch ?? null,
       channelId: channelId ?? null,
+      color: color ?? null,
       createdAt: new Date().toISOString(),
       phase: 'implement',
       pendingAsks: [],

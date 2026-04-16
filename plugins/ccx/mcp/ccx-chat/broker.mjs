@@ -48,11 +48,45 @@ async function loadConfig() {
   return cfg;
 }
 
+// Visual distinguisher when the channel hosts multiple concurrent sessions.
+// Squares are used (not circles) so they never collide with the 🟢/🔴 verbs
+// in open/close announcements. ⬜/⬛ are excluded — one of them blends into
+// every Discord theme.
+const SESSION_COLORS = ['🟥', '🟧', '🟨', '🟩', '🟦', '🟪', '🟫'];
+
+function hashColor(sessionId) {
+  let h = 5381;
+  for (let i = 0; i < sessionId.length; i += 1) {
+    h = ((h << 5) + h + sessionId.charCodeAt(i)) | 0;
+  }
+  return SESSION_COLORS[Math.abs(h) % SESSION_COLORS.length];
+}
+
+function colorOf(session) {
+  return session.color ?? hashColor(session.id);
+}
+
+// Sequential assignment per channel: the first colour not in use by another
+// live session on the same channel. Compare against the *visible* colour
+// (colorOf), not just the persisted field — sessions recovered from snapshots
+// written before `color` existed have `s.color === null` but still render via
+// hashColor, so a new session would otherwise be allowed to pick the same
+// visible emoji. Hash fallback only kicks in when more than
+// SESSION_COLORS.length sessions are concurrently open on one channel —
+// unrealistic in practice but keeps the function total.
+function pickColor(channelId, registry) {
+  const taken = new Set(
+    registry.listForChannel(channelId).map((s) => colorOf(s)),
+  );
+  const free = SESSION_COLORS.find((c) => !taken.has(c));
+  return free ?? null;
+}
+
 function formatSessionLine(s) {
   const age = humanAge(Date.parse(s.createdAt));
   const branch = s.branch ? ` · ${s.branch}` : '';
   const tag = s.recovered ? ' (recovered)' : '';
-  return `• \`#${s.id}\`${branch} · ${s.phase} · ${age}${tag} — ${s.label}`;
+  return `${colorOf(s)} \`#${s.id}\`${branch} · ${s.phase} · ${age}${tag} — ${s.label}`;
 }
 
 function humanAge(tsMs) {
@@ -201,9 +235,10 @@ async function main() {
   }
 
   async function announceSession(session, verb) {
+    const color = colorOf(session);
     const text = verb === 'open'
-      ? `🟢 ccx session opened\n${formatSessionLine(session)}`
-      : `🔴 ccx session closed \`#${session.id}\` — ${verb}`;
+      ? `${color} 🟢 ccx session opened\n${formatSessionLine(session)}`
+      : `${color} 🔴 ccx session closed \`#${session.id}\` — ${verb}`;
     try {
       const ids = await adapter.sendTo(session.channelId, text);
       for (const id of ids) messageToSession.set(id, session.id);
@@ -385,15 +420,18 @@ async function main() {
       return {};
     },
     async register({ label, cwd, branch, channelId }) {
+      const targetChannel = channelId ?? config.discord.channelId;
+      const color = pickColor(targetChannel, registry);
       const session = registry.register({
         label,
         cwd,
         branch,
-        channelId: channelId ?? config.discord.channelId,
+        channelId: targetChannel,
+        color,
       }, { exclude: registry.cancelled });
       await registry.save();
       try {
-        const text = `🟢 ccx session opened\n${formatSessionLine(session)}`;
+        const text = `${colorOf(session)} 🟢 ccx session opened\n${formatSessionLine(session)}`;
         const ids = await adapter.sendTo(session.channelId, text);
         for (const id of ids) messageToSession.set(id, session.id);
       } catch (err) {
@@ -407,9 +445,10 @@ async function main() {
       assertLive(sessionId);
       const session = registry.get(sessionId);
       if (!session) throw new Error(`unknown session ${sessionId}`);
+      const color = colorOf(session);
       const prefix = session.branch
-        ? `\`#${session.id}\` \`${session.branch}\``
-        : `\`#${session.id}\``;
+        ? `${color} \`#${session.id}\` \`${session.branch}\``
+        : `${color} \`#${session.id}\``;
       const ids = await adapter.sendTo(session.channelId, `${prefix} ${text}`);
       for (const id of ids) messageToSession.set(id, session.id);
       return { messageIds: ids };
@@ -426,7 +465,7 @@ async function main() {
       const askId = `${sessionId}-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
       const ids = await adapter.sendTo(
         session.channelId,
-        `❓ \`#${session.id}\` ${prompt}\n_Reply to this message (timeout ${timeout}s)._`,
+        `${colorOf(session)} ❓ \`#${session.id}\` ${prompt}\n_Reply to this message (timeout ${timeout}s)._`,
       );
       for (const id of ids) {
         messageToSession.set(id, session.id);
