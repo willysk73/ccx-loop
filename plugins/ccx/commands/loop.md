@@ -1,7 +1,7 @@
 ---
 description: "Automated dev loop — (implement → codex review → fix) × N → handoff → commit"
-argument-hint: "[--loops N] [--min-severity LEVEL] [--min-confidence N] [--commit] [--worktree[=NAME]] <task description>"
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent, AskUserQuestion, TaskCreate, TaskUpdate
+argument-hint: "[--loops N] [--min-severity LEVEL] [--min-confidence N] [--commit] [--worktree[=NAME]] [--chat] <task description>"
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent, AskUserQuestion, TaskCreate, TaskUpdate, mcp__ccx-chat__chat_register, mcp__ccx-chat__chat_send, mcp__ccx-chat__chat_ask, mcp__ccx-chat__chat_set_phase, mcp__ccx-chat__chat_close
 ---
 
 # /ccx:loop — Fixed-N Dev Loop
@@ -20,6 +20,7 @@ Parse the raw arguments:
 - `--min-confidence N` — ignore findings whose `confidence` is below `N` (0.0–1.0). Default: `0.0`.
 - `--commit` — auto-commit without asking (skip the prompt), subject to the Phase 4 auto-commit gate.
 - `--worktree` or `--worktree=NAME` — run the entire loop in an isolated git worktree on a new branch. Enables parallel tasks in the same repo without `git diff` cross-contamination (Codex review relies on the working tree diff). The name, if supplied, MUST use the `=` form (`--worktree=feat-auth`) — a space-separated positional value is NOT accepted because it would be ambiguous with the first word of the task description (e.g. `--worktree fix auth bug` cannot distinguish `fix` as a name versus the first task word). Bare `--worktree` generates a timestamp name. Branch = `ccx/<NAME>`, worktree path = `<repo>-<NAME>`. See Phase 0.5.
+- `--chat` — bridge this run to Discord via the `ccx-chat` MCP server. Announces session start, sends per-cycle summaries, asks the commit question in Discord (with `AskUserQuestion` as fallback), and announces session close. Requires one-time `/ccx:chat-setup`. See Phase 0.7.
 - Everything else is the **task description**.
 
 Finding identity: throughout the loop, a finding's stable key is the logical **tuple `(file, title, body)`** — compared field-by-field, not as a concatenated string. Title and body can legitimately contain `:` or other delimiters, so concatenation would collapse distinct findings; equality/lookup must treat the three fields independently (e.g. `JSON.stringify([file, title, body])` is an acceptable concrete representation). Line numbers are deliberately excluded because fixes shift them and would otherwise defeat stuck-finding detection. `body` is included as a discriminator so that multiple distinct findings sharing a generic title in the same file (e.g. two separate "Unused import" findings) do NOT share a streak counter.
@@ -44,7 +45,7 @@ Examples:
 - You MUST actually call the Bash tool to run the review command. Never fabricate review output.
 - You MUST actually call Edit/Write tools to fix findings. Never claim a fix without editing the file.
 - After each fix phase, run `git diff --stat` and print the output so the user can see exactly which files changed.
-- Print a structured cycle summary: `Review {i}/{N}: verdict={verdict}, findings={total} (in-scope={inScope}, skipped={skipped}, fixed={fixed}, unresolved={unresolved})`
+- Print a structured cycle summary: `Review {i}/{N}: verdict={verdict}, findings={total} (in-scope={inScope}, skipped={skipped}, fixed={fixed}, unresolved={unresolved})`. When `CHAT_SESSION_ID` is set, also call `chat_send` with the same summary string, and `chat_set_phase` with `review {i}/{N}` at cycle start and `fix {i}/{N}` before Step C (skip the phase update if Step C is skipped).
 - If the review command fails (non-zero exit, no JSON output, or `CODEX_ROOT` not found), STOP and report to the user. Never proceed with fabricated results.
 - **Fix verification:** after each Edit/Write, treat a tool error (file missing, `old_string` not unique, etc.) as `unresolved` — record it, surface it in the cycle summary, and do not silently absorb it.
 
@@ -101,6 +102,26 @@ Steps:
 7. After Phase 4 commits, do NOT delete the worktree. The user is responsible for pushing (`git push -u origin "<branch>"`), opening a PR, and cleaning up with `git worktree remove "<worktree-path>"` once merged. Quote both substitutions in the reported commands — `<worktree-path>` may contain spaces from `<REPO_ROOT>`, and emitting an unquoted command would fail when the user copy-pastes it. Surface this in the final report with the exact quoted commands.
 
 Storage note: `git worktree` shares the `.git` object store with the main repo, so extra disk cost is roughly the checked-out source tree (not `.git`). Build artifacts (`node_modules`, `target/`, `.venv/`) are NOT shared — if those are large, the user should symlink or rebuild inside the worktree. Mention this only if the task touches such directories.
+
+---
+
+## Phase 0.7: Chat bridge setup (only if `--chat` is set)
+
+**Tool availability check:** before calling any `mcp__ccx-chat__*` tool, verify it exists in the available tool list. If the `ccx-chat` MCP server is not registered (the user hasn't run `/ccx:chat-setup` yet, or it failed), the `mcp__ccx-chat__chat_register` tool will not be available. In that case, log: `--chat requested but ccx-chat MCP server is not available. Run /ccx:chat-setup first.` Then unset `--chat` and continue without chat. Do NOT abort the loop.
+
+If the tool is available, call `mcp__ccx-chat__chat_register` with:
+- `label` — the task description (truncated to ~80 chars by the broker).
+- `cwd` — absolute working directory (worktree path when `--worktree` is active, else repo root).
+- `branch` — output of `git rev-parse --abbrev-ref HEAD` from that cwd.
+
+Store the returned `sessionId` as `CHAT_SESSION_ID`. Treat the bridge as best-effort:
+
+- If the register call fails (broker not configured, Discord down, missing config), log the error, unset `CHAT_SESSION_ID`, and continue without chat. Do NOT abort the loop — the user opted into chat, not into blocking on it.
+- When a later `chat_*` call fails, keep `CHAT_SESSION_ID` but mark the bridge as degraded; stop attempting further chat calls for the rest of the run to avoid spamming errors. The final report must mention that chat was lost mid-run.
+- **Cancellation semantics:** if any `chat_*` call (other than `chat_close`) returns an error whose message contains the substring `cancelled` (e.g. `session ab12 was cancelled (user)`), the user issued `!ccx cancel #<id>` from Discord. STOP the loop immediately without committing, skip remaining phases, and exit via `chat_close({status: "aborted"})`. Do not interpret generic transient errors (network, timeout) as cancellations — only the literal substring `cancelled`.
+  **Known limitation:** cancellation is only detected on the next `chat_*` call. During long implement/review/fix phases with no chat RPCs, the loop continues until it reaches the next `chat_send` or `chat_set_phase`. This is inherent in the architecture — Claude Code tool calls cannot be interrupted externally.
+
+After successful register, call `chat_set_phase({sessionId: CHAT_SESSION_ID, phase: "implement"})`.
 
 ---
 
@@ -214,6 +235,11 @@ For every other exit state — budget-exhausted with unfixed findings, stuck-fin
 
 If `--commit` applies after the gate: commit directly without asking.
 Otherwise: ask the user ONE question — whether to commit.
+
+**Chat bridge:** when `CHAT_SESSION_ID` is set and the commit question must be asked:
+1. Call `chat_set_phase` with `commit?` and `chat_ask` with a concise prompt (include the exit reason and any unresolved/skipped counts).
+2. If the result's `source` is `timeout`, `cancel`, or `closed`, or the call errors, fall back to `AskUserQuestion`. Otherwise interpret the `reply` string (case-insensitive `yes`/`y`/`commit`/`ok` → commit; anything else → stop).
+3. On final exit (whether committed or not), call `chat_close` with `status` set to one of: `approved`, `filtered-clean`, `stuck`, `budget-exhausted`, `aborted`, `error` — matching the actual exit path. Run `chat_close` exactly once, in a `finally`-style block that runs even when earlier phases threw.
 
 If committing:
 - Track `EDITED_PATHS` throughout the loop: the set of file paths Claude **intentionally** created, modified, renamed, or deleted. This includes:

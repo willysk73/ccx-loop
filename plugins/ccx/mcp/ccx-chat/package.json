@@ -1,0 +1,22 @@
+{
+  "name": "ccx-chat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Two-way chat bridge (Discord) for ccx dev-loop sessions.",
+  "type": "module",
+  "bin": {
+    "ccx-chat-mcp": "./server.mjs",
+    "ccx-chat-broker": "./broker.mjs"
+  },
+  "scripts": {
+    "broker": "node ./broker.mjs",
+    "server": "node ./server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "discord.js": "^14.16.3"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}

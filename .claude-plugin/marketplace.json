@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Claude Code plugin for automated dev loops with Codex review gates.",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "homepage": "https://github.com/willysk73/ccx-loop",
     "repository": "https://github.com/willysk73/ccx-loop",
     "license": "MIT"
@@ -13,8 +13,8 @@
   "plugins": [
     {
       "name": "ccx",
-      "description": "Automated dev loops with Codex review gates. Provides /ccx:loop (fixed N cycles) and /ccx:forever (loop until approval).",
-      "version": "0.2.0",
+      "description": "Automated dev loops with Codex review gates. Provides /ccx:loop, /ccx:forever, and an optional Discord chat bridge (/ccx:chat-setup + --chat).",
+      "version": "0.3.0",
       "source": "./plugins/ccx"
     }
   ]

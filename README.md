@@ -32,6 +32,19 @@ Or from inside Claude Code:
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 - [Codex](https://github.com/openai/codex) plugin (for review gates)
+- Node.js ≥ 18.17 (only required if you enable the optional Discord chat bridge)
+
+### Optional: Discord chat bridge
+
+`/ccx:loop --chat` and `/ccx:forever --chat` mirror the run into a Discord channel — cycle summaries, stuck-finding reports, and the commit prompt are sent to chat, and your reply unblocks the loop. Multiple concurrent sessions are supported; each has a short `#id` and the bot can `!ccx sessions` / `!ccx focus <id>` / `!ccx cancel <id>` at any time.
+
+One-time setup:
+
+```
+/ccx:chat-setup
+```
+
+This installs `discord.js` + MCP SDK into the plugin, creates `~/.claude/ccx-chat/config.json`, and smoke-tests the broker. You need a Discord bot token and the channel ID to use.
 
 ## Usage
 

@@ -1,0 +1,12 @@
+{
+  "backend": "discord",
+  "discord": {
+    "token": "PASTE_BOT_TOKEN_HERE",
+    "channelId": "PASTE_CHANNEL_ID_HERE",
+    "allowedUserIds": ["PASTE_YOUR_DISCORD_USER_ID_HERE"],
+    "commandPrefix": "!ccx"
+  },
+  "ask": {
+    "defaultTimeoutSec": 900
+  }
+}
