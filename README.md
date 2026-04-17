@@ -4,12 +4,13 @@ Claude Code plugin for automated dev loops with Codex review gates.
 
 Implement a task, get it reviewed by Codex, fix findings, repeat — then commit. All in one command.
 
-The plugin ships two commands:
+The plugin ships three commands:
 
 | Command | Behavior |
 |---------|----------|
-| `/ccx:loop`    | Run a fixed number of review-fix cycles (default 2). |
-| `/ccx:forever` | Repeat review-fix cycles until Codex approves (safety cap default 100). |
+| `/ccx:loop`       | Run a fixed number of review-fix cycles (default 2). |
+| `/ccx:forever`    | Repeat review-fix cycles until Codex approves (safety cap default 100). |
+| `/ccx:supervisor` | Dispatch N parallel `/ccx:loop` workers from a shared `BOARD.md` (M1: dispatch + naive merge). |
 
 ## Install
 
@@ -73,6 +74,24 @@ This installs `discord.js` + MCP SDK into the plugin, creates `~/.claude/ccx-cha
 | `--min-severity LEVEL` | Ignore findings below `critical\|high\|medium\|low` | `low` (fix all) |
 | `--min-confidence N` | Ignore findings with confidence < N (0.0–1.0) | `0.0` |
 | `--commit` | Auto-commit on clean approval (gated) | off |
+
+### `/ccx:supervisor` — parallel orchestrator (M1)
+
+```
+/ccx:supervisor [--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--dry-run]
+```
+
+Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root. Each task gets its own worktree, brief file (`.ccx/tasks/T-<id>.md`), and merge commit on approval.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--parallel N` | Max concurrent workers (1–10) | 3 |
+| `--integration BRANCH` | Branch merges land on | current branch |
+| `--max-tasks M` | Stop after M merges | unlimited |
+| `--worker-loops N` | `--loops N` passed to each worker (1–20) | 5 |
+| `--dry-run` | Print dispatch plan, don't commit or spawn | off |
+
+**M1 scope** is dispatch-only: BOARD → briefs → `claude -p` workers → naive merge. No `chat_ask` interception (M2), autonomous answering (M3), or scope-overlap gating (M4). See `docs/supervisor-design.md` for the full design.
 
 ### Examples
 
