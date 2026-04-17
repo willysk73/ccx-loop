@@ -1,12 +1,12 @@
 ---
-description: "Orchestrate N parallel /ccx:loop workers from BOARD.md — M3: dispatch + autonomous chat_ask answering"
+description: "Orchestrate N parallel /ccx:loop workers from BOARD.md — M4: dispatch + autonomous chat_ask + scope-overlap gate + pre-merge dry-run"
 argument-hint: "[--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--dry-run]"
 allowed-tools: Bash, BashOutput, Read, Write, Edit, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate, mcp__ccx-chat__chat_supervisor_poll, mcp__ccx-chat__chat_supervisor_reply, mcp__ccx-chat__chat_supervisor_escalate, mcp__ccx-chat__chat_supervisor_close
 ---
 
-# /ccx:supervisor — Parallel Worker Orchestrator (M3)
+# /ccx:supervisor — Parallel Worker Orchestrator (M4)
 
-One human drives N parallel `/ccx:loop` workers from a shared `BOARD.md`. Each task runs in its own git worktree, gets its own brief file, and merges back into the integration branch on approval. Worker `chat_ask` calls are intercepted by the broker; the supervisor session answers from the brief / BOARD / merge history when possible, escalating to Discord only when no deterministic answer fits.
+One human drives N parallel `/ccx:loop` workers from a shared `BOARD.md`. Each task runs in its own git worktree, gets its own brief file, and merges back into the integration branch on approval. Worker `chat_ask` calls are intercepted by the broker; the supervisor session answers from the brief / BOARD / merge history when possible, escalating to Discord only when no deterministic answer fits. Tasks whose scope globs touch overlapping files are serialized at dispatch time so concurrent worktrees do not produce conflicting merges, and every merge is staged via a `--no-commit` dry-run before it is finalized.
 
 Raw arguments: `$ARGUMENTS`
 
@@ -14,12 +14,11 @@ Raw arguments: `$ARGUMENTS`
 
 - **M1 — dispatch.** `BOARD.md` → briefs → `claude -p` workers → naive `--no-ff` merge → batch BOARD update.
 - **M2 — broker supervisor adapter.** `backend: "supervisor"` in `~/.claude/ccx-chat/config.json` queues worker asks in the broker and exposes `chat_supervisor_{poll,reply,escalate,close}` MCP tools, with a per-ask auto-escalate timer as the no-supervisor-session fallback.
-- **M3 — autonomous answering (this milestone).** `/ccx:supervisor` polls the broker's supervisor queue every scheduling iteration. For each pending ask it consults the task brief's `## Decisions` table, BOARD `## Direction`, and the integration branch's merge-commit history. A confident deterministic match → `chat_supervisor_reply`; otherwise → `chat_supervisor_escalate` (human answers on Discord). Every supervisor decision is appended as JSONL to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can audit after the fact.
+- **M3 — autonomous answering.** `/ccx:supervisor` polls the broker's supervisor queue every scheduling iteration. For each pending ask it consults the task brief's `## Decisions` table, BOARD `## Direction`, and the integration branch's merge-commit history. A confident deterministic match → `chat_supervisor_reply`; otherwise → `chat_supervisor_escalate` (human answers on Discord). Every supervisor decision is appended as JSONL to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can audit after the fact.
+- **M4 — scope-overlap gate + pre-merge dry-run (this milestone).** Step A defers any pending task whose `scope.include` matches a tracked file already claimed by a `RUNNING` task — overlap is computed by intersecting the two `git ls-files -- <pathspecs>` results plus a literal-glob equality fallback for globs that match no current files. Deferred tasks stay in `PENDING_POOL` and are retried next iteration when slots free; nothing is marked `blocked`. Step B's merge stages the integration branch via `git merge --no-commit --no-ff --no-edit`, inspects unmerged paths, and either finalizes with `git commit --no-edit` (clean) or `git merge --abort` (conflict) — separating conflict detection from commit creation. The conflict path remains identical to M3.
 
-Still deferred (out of scope for M3):
+Still deferred (out of scope for M4):
 
-- Scope-glob overlap detection (M4). If two dispatched tasks touch the same files, merges may conflict; the loop catches conflicts at merge time and marks the task `blocked`, but does not pre-filter dispatch.
-- Pre-merge conflict dry-run (M4).
 - Stuck-exit auto-revise brief and re-dispatch (M5).
 - Supervisor-session resume after close (stretch).
 
@@ -78,7 +77,13 @@ If anything fails, print the exact error and stop. No partial setup.
 1. Read `REPO_ROOT/BOARD.md`. Extract:
    - The `## Direction` section (everything from the line after `## Direction` up to the next `## ` heading or EOF). Store as `DIRECTION_TEXT`. May be empty.
    - The single YAML fenced code block under `## Tasks`. Parse it as a YAML array. If parsing fails or multiple fenced blocks appear under `## Tasks`, STOP with the parse error.
-2. Validate each task entry. **Required** fields: `id` (string matching `^T-[0-9]+$`), `title` (non-empty string), `status` (one of `pending | assigned | review | merged | blocked`), `scope.include` (non-empty array of strings). **Optional** with defaults: `scope.exclude` (`[]`), `priority` (`normal`, one of `high | normal | low`), `depends_on` (`[]`, array of task ids), `brief` (`.ccx/tasks/<id>.md`), `notes` (`""`). If any task fails validation, STOP and print the offending row(s) verbatim.
+2. Validate each task entry. **Required** fields: `id` (string matching `^T-[0-9]+$`), `title` (non-empty string), `status` (one of `pending | assigned | review | merged | blocked`), `scope.include` (non-empty array of strings). **Optional** with defaults: `scope.exclude` (`[]`), `priority` (`normal`, one of `high | normal | low`), `depends_on` (`[]`, array of task ids), `brief` (`.ccx/tasks/<id>.md`), `notes` (`""`).
+
+   **Glob-string contract** (used by M4's overlap gate, §P2.4): every entry in `scope.include` and `scope.exclude` MUST be a non-empty string that contains no NUL byte and no newline character — those are the two characters that would break `git ls-files -z` output parsing. All other characters (including single-quote `'`, double-quote `"`, spaces, `$`, backtick) are permitted because §P2.4 mandates exec/argv invocation; single-quote in particular is a legal character in committed Git paths (e.g. `docs/engineer's-guide.md`) and rejecting it would be a regression in accepted task scopes.
+
+   **Pathspec sanity probe** (M4 — runs at validation time, before the dispatch loop starts): for every task whose `status == "pending"`, run `git ls-files -z --` with each glob in `scope.include` AND `scope.exclude` as its own argv element (per §P2.4 step 1's contract — direct exec, no shell). The probe uses Git's pathspec parser without doing anything with the output; its sole purpose is to catch malformed pathspecs deterministically at startup. Any non-zero exit, or stderr matching `bad pathspec` / `unknown pathspec` / `pathspec '...' .* invalid`, fails this task's validation. Without this probe, malformed `:(...)` magic or a stray `\` in a pathspec would only surface inside §P2.4's overlap gate, which defers-and-retries on `git ls-files` failure — turning a bad BOARD row into an infinite supervisor loop because no exit condition fires while `READY` keeps re-including a task that can never dispatch. STOP and print every offending task id with the verbatim git stderr; the human fixes the BOARD row and re-runs.
+
+   If any task fails validation (shape, required-field, glob-string contract, or pathspec sanity probe), STOP and print the offending row(s) verbatim.
 3. Compute the two dispatch pools. Both are re-evaluated across the whole run (see P2 Step A1), so treat them as live views rather than frozen snapshots:
    - `PENDING_POOL` — every task with `status == "pending"`. Stays in this pool until the supervisor picks it up.
    - `NOT_READY_REASONS` — for each pending task whose `depends_on` contains any non-`merged` entry, record the unmet deps (for reporting). This is derivation, not filtering.
@@ -98,29 +103,39 @@ If anything fails, print the exact error and stop. No partial setup.
 State:
 
 - `SLOTS = --parallel N`
-- `RUNNING = {}` — map `task_id -> { shell_id, worktree_path, branch, log_path, started_at }`
+- `RUNNING = {}` — map `task_id -> { shell_id, worktree_path, branch, log_path, started_at, scope_include }`. `scope_include` is the BOARD row's `scope.include` glob list (a list of strings, copied verbatim at dispatch time), used by Step A's scope-overlap gate to detect which currently-running task already claims the files a candidate task would touch.
 - `DISPATCHED = set()` — every `<TASK_ID>` this supervisor has launched in this run (populated in Step A step 7, never removed). Used by Step B2's ownership filter so asks from workers that exit between ask-time and the next poll are still recognized as ours.
 - `MERGED_COUNT = 0`
 - `MERGED_IDS = []`, `BLOCKED_IDS = []`
 - `PENDING_POOL` and `READY` from P1 — treated as live views; recomputed after every completion (see A1 below).
+- `DEFERRED_THIS_PASS = set()` — Step A scratch state, cleared at the top of every Step A pass. Tracks which `READY` task ids have already been popped and deferred this pass due to scope-overlap so the inner loop does not re-pop and re-defer the same task indefinitely (popping is destructive — without this set the head of `READY` would be reconsidered until slots fill, masking lower-priority dispatchable tasks behind it).
+- `EVER_DEFERRED_BY_SCOPE = set()` — run-level accumulator, NEVER cleared. A1's clear of `DEFERRED_THIS_PASS` is correct for slot-fill scheduling but discards the history P3 needs to classify leftover `PENDING_POOL` entries. Every time A2 step 1a defers a task by scope-overlap, also add its id to `EVER_DEFERRED_BY_SCOPE`. P3 reads this set to attach the `scope-deferred` reason to any task that ends the run still in `PENDING_POOL`. A task that was deferred earlier but eventually dispatched (and then merged or blocked) stays in this set, but P3 ignores it because it is no longer in `PENDING_POOL` at exit — the set is purely a tag, not a status.
+- `STOP_DISPATCHING = false` — set to `true` by Step B's merge-commit-failed branch (M4) when the integration-branch commit pipeline rejects a merge commit. While `true`, Step A's slot-fill is skipped entirely so no new workers start, but Step B continues to drain `RUNNING` so already-in-flight peers are not stranded as `assigned`. Loop exit gains a new condition 3 (see below) that fires once `RUNNING` drains, because `READY` may legitimately still hold pending tasks at that point — those tasks are intentionally being left for a future supervisor run after the human resolves the broken commit pipeline.
 
 **Exit conditions** (evaluated at the top of every iteration, after A1 recomputes `READY`):
 
 1. `RUNNING == {}` AND `READY == []` → exit. Nothing is running and nothing can be dispatched right now. Any task still in `PENDING_POOL` must have unmet deps that point at `blocked` (or non-existent) tasks, so no future completion will unblock them in this run. Report those as stranded in P3.
 2. `--max-tasks M` is set AND `MERGED_COUNT >= M` AND `RUNNING == {}` → exit. Cap reached and no workers left to drain.
+3. `STOP_DISPATCHING == true` AND `RUNNING == {}` → exit. The integration-branch commit pipeline rejected a merge commit and the supervisor is in drain-then-stop mode (Step B's merge-commit-failed branch). Once the last in-flight worker has been classified by Step B, there is nothing left for the loop to do — A2 is gated off by `STOP_DISPATCHING`, so any tasks still in `PENDING_POOL` (READY or not) MUST stay there until a future supervisor run picks them up after the human fixes the broken commit pipeline. Without this condition the loop would spin forever in this scenario, because A1 keeps `READY` populated from `PENDING_POOL` even when A2 cannot act on it. Report any leftover `PENDING_POOL` entries as `deferred-by-stop-dispatching` in P3.
 
-Without BOTH conditions the loop can hang — condition 1 covers dependency-blocked stranding, condition 2 covers cap-reached-but-pending-tasks-left. `PENDING_POOL` becoming empty is also an implicit exit because it forces `READY == []` in A1, which triggers condition 1 once `RUNNING` drains.
+Without all three conditions the loop can hang — condition 1 covers dependency-blocked stranding, condition 2 covers cap-reached-but-pending-tasks-left, condition 3 covers commit-pipeline-broken-but-pending-tasks-left. `PENDING_POOL` becoming empty is also an implicit exit because it forces `READY == []` in A1, which triggers condition 1 once `RUNNING` drains.
 
 **Pool-removal rule.** Every time a task is classified `blocked` — whether pre-dispatch (stale-artifact / spawn-failure) or post-completion (no-commit / error / merge-conflict) — it MUST be removed from `PENDING_POOL` in the same step. Otherwise A1 would re-select it on the next pass and the same failure handler would fire indefinitely. The rule is: "blocked → out of the pool, into `BLOCKED_IDS` for the P2 Step D batch commit".
 
 ### Step A — Fill slots
 
-A1. **Recompute `READY` first.** Iterate `PENDING_POOL`; re-include any task whose `depends_on` set is now entirely `merged` in the current in-memory BOARD state (picks up newly-unblocked tasks after each merge). Re-apply the priority + id sort. This recomputation is cheap and MUST run at the top of every Step A pass — computing `READY` only once in P1 would strand tasks whose deps merge mid-run.
+A1. **Recompute `READY` first.** Iterate `PENDING_POOL`; re-include any task whose `depends_on` set is now entirely `merged` in the current in-memory BOARD state (picks up newly-unblocked tasks after each merge). Re-apply the priority + id sort. This recomputation is cheap and MUST run at the top of every Step A pass — computing `READY` only once in P1 would strand tasks whose deps merge mid-run. Then **clear `DEFERRED_THIS_PASS`** so the new pass starts with a fresh deferral list (deferrals from a previous pass were instructive only for that pass — by the time A1 runs again, the `RUNNING` set has already changed via Step B drains and the overlap picture may differ). A1 always runs, even when `STOP_DISPATCHING == true`, so P3 reporting and the loop's exit condition still observe the correct `READY` state.
 
-A2. While `len(RUNNING) < SLOTS` AND `READY` is non-empty AND (`--max-tasks` unset OR `MERGED_COUNT < M`):
+A2. **Skip A2 entirely when `STOP_DISPATCHING == true`** — no slot-fill, no overlap checks, no spawns. The loop relies on Step B to drain `RUNNING` until **exit condition 3** fires naturally (condition 1 cannot fire while `STOP_DISPATCHING` is set because A1 keeps `READY` populated from any leftover `PENDING_POOL` entries; condition 3 was added precisely so this path has a terminating exit). Otherwise, while `len(RUNNING) < SLOTS` AND `READY` contains at least one task NOT in `DEFERRED_THIS_PASS` AND (`--max-tasks` unset OR `MERGED_COUNT < M`):
 
-1. Pop the highest-priority ready task. Call it `TASK`. Remove it from `PENDING_POOL` only after step 7 confirms a live worker — until then, the task is still "pending" from the persisted-BOARD perspective.
-1a. **Stale-branch / stale-worktree gate.** Before writing anything, verify that neither the target branch nor the target worktree path exists yet:
+1. Pop the highest-priority ready task that is not in `DEFERRED_THIS_PASS`. Call it `TASK`. Remove it from `PENDING_POOL` only after step 7 confirms a live worker — until then, the task is still "pending" from the persisted-BOARD perspective.
+1a. **Scope-overlap gate.** Before any side effect, check whether `TASK.scope.include` overlaps with any `RUNNING_TASK.scope_include` for `RUNNING_TASK` currently in `RUNNING`. Use the algorithm in §P2.4. If any pairwise overlap is detected:
+   - Add `TASK.id` to `DEFERRED_THIS_PASS` (per-pass, scoped to the inner slot-fill loop).
+   - Add `TASK.id` to `EVER_DEFERRED_BY_SCOPE` (run-level, used by P3 to label leftover `PENDING_POOL` rows). Adding repeatedly is a no-op — set semantics.
+   - Do NOT mark `blocked`. Do NOT remove from `PENDING_POOL`. Do NOT touch BOARD or write a brief.
+   - Print one line: `deferred <TASK.id> — scope overlaps running <OVERLAP_TASK.id> on <SHARED_FILES (max 3, …)>`. Overlap is a transient parallelism gate, not a failure mode; the task is re-evaluated next iteration.
+   - Continue the inner slot-fill loop (try the next non-deferred ready task). Do not advance to step 1b.
+1b. **Stale-branch / stale-worktree gate.** Before writing anything, verify that neither the target branch nor the target worktree path exists yet:
    ```bash
    git rev-parse --verify "refs/heads/ccx/<TASK.id>" 2>/dev/null   # expect non-zero
    test -e "<REPO_ROOT>-<TASK.id>"                                 # expect non-zero
@@ -170,7 +185,7 @@ A2. While `len(RUNNING) < SLOTS` AND `READY` is non-empty AND (`--max-tasks` uns
    - In-memory edit: set the BOARD row's `status: "assigned"`, `worktree: "<REPO_ROOT>-<TASK.id>"`, `branch: "ccx/<TASK.id>"`, `started_at: "<UTC now ISO 8601>"`. Edit must be read-YAML-block → modify in memory → re-emit → replace the exact YAML block. Preserve sibling rows byte-for-byte.
    - `git add -- BOARD.md` and `git commit -m "supervisor: dispatch <TASK.id> <TASK.title>"`.
    - If this commit fails, the worker is already running — log the error, leave the worker alone (it will eventually finish and be picked up by Step B), and STOP the whole run. Do NOT kill the worker; its log and branch are preserved for manual recovery.
-7. Write `RUNNING[TASK.id] = { shell_id: SHELL_ID, worktree_path: "<REPO_ROOT>-<TASK.id>", branch: "ccx/<TASK.id>", log_path: ".ccx/workers/<TASK.id>.log", started_at }` AND add `TASK.id` to the `DISPATCHED` set. `DISPATCHED` is never removed from — it's the ownership source of truth for Step B2's filter across the whole run. Remove `<TASK.id>` from `PENDING_POOL`.
+7. Write `RUNNING[TASK.id] = { shell_id: SHELL_ID, worktree_path: "<REPO_ROOT>-<TASK.id>", branch: "ccx/<TASK.id>", log_path: ".ccx/workers/<TASK.id>.log", started_at, scope_include: TASK.scope.include }` AND add `TASK.id` to the `DISPATCHED` set. The `scope_include` field is a verbatim copy of the BOARD row's glob list captured at dispatch time — Step A's overlap gate (§P2.4) reads it on every subsequent pass, so it MUST snapshot the value rather than re-read BOARD (a concurrent BOARD edit between dispatch and the next pass would otherwise change the overlap picture under the supervisor). `DISPATCHED` is never removed from — it's the ownership source of truth for Step B2's filter across the whole run. Remove `<TASK.id>` from `PENDING_POOL`.
 8. Print a one-line dispatch notice: `dispatched <TASK.id> (<TASK.title>) → shell <SHELL_ID>, log <log_path>`.
 
 ### Step B — Drain completions
@@ -189,19 +204,98 @@ For each `(task_id, meta)` in `RUNNING`:
    - **no-commit** — exit code 0 but no new commits. Worker exited via filtered-unapproved, stuck, cap-hit, or user cancellation — `/ccx:loop`'s Phase 4 auto-commit gate correctly blocked the commit. Mark `blocked`.
    - **error** — non-zero exit code (crash, invalid args, missing `claude -p`). Mark `blocked`.
 
-3. For **approved**, attempt a naive merge onto the integration branch:
+3. For **approved**, attempt a **two-step pre-merge dry-run** onto the integration branch — stage the merge with `--no-commit`, inspect the index, then either finalize or abort. Splitting "test the merge" from "commit the merge" lets the supervisor reason about conflicts as a first-class outcome (and gives M5 a hook to run extra validation between stages without rewriting the merge call):
 
    ```bash
-   git merge --no-ff --no-edit "ccx/<task_id>"
+   if git merge --no-commit --no-ff --no-edit "ccx/<task_id>"; then
+     # Dry-run reports clean — finalize using the prepared MERGE_MSG.
+     git commit --no-edit
+   else
+     # Non-zero from --no-commit. Two sub-cases:
+     #   - conflict (unmerged paths present)
+     #   - non-conflict failure (refusal, branch-protection, no-merge-already-in-progress)
+     # Capture unmerged paths BEFORE the abort wipes the index, then abort
+     # (ignoring the abort's exit code — `git merge --abort` errors when no
+     # merge is actually in progress, which is correct for the non-conflict case).
+     CONFLICT_FILES="$(git diff --name-only --diff-filter=U)"
+     git merge --abort 2>/dev/null || true
+   fi
    ```
 
-   - On success (exit 0 AND `HEAD` moved): `MERGED_COUNT += 1`, append `task_id` to `MERGED_IDS`, stash a BOARD-row update in memory: `status: "merged"`, `finished_at: "<now>"`, `exit_status: "approved"`. Do NOT commit BOARD yet — step D batches all BOARD updates into one commit.
-   - On conflict: capture the conflicted file list **before** aborting — once `git merge --abort` runs, the unmerged index is gone and `git diff --name-only --diff-filter=U` returns empty. Order of operations:
+   Four outcomes (the third and fourth are M4 additions; the first two preserve the M3 behavior):
+
+   - **Clean dry-run + commit succeeds** (`git merge --no-commit ...` exit 0 AND `git commit --no-edit` exit 0 AND `HEAD` moved): `MERGED_COUNT += 1`, append `task_id` to `MERGED_IDS`, stash a BOARD-row update in memory: `status: "merged"`, `finished_at: "<now>"`, `exit_status: "approved"`. Do NOT commit BOARD yet — step D batches all BOARD updates into one commit.
+   - **Conflict** (`git merge --no-commit ...` exit non-zero AND `CONFLICT_FILES` non-empty): capture `CONFLICT_FILES` **before** running `git merge --abort` — once the abort runs, the unmerged index is gone and `git diff --name-only --diff-filter=U` returns empty. Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-conflict"`, `notes: "conflict on <CONFLICT_FILES, comma-separated>"`. The worker branch stays intact — the human resolves manually.
+   - **Non-conflict merge refusal** (`git merge --no-commit ...` exit non-zero AND `CONFLICT_FILES` is empty): Git refused the merge for a reason other than file-level conflicts — examples include a `pre-merge-commit` hook rejecting the merge before any tree was written, a branch protection / signed-merge requirement that fails up front, an existing residual `MERGE_HEAD` from a prior failed iteration that Git refuses to overlay, or an unreachable / corrupt object on the worker branch. Some of these are **transient** (residual `MERGE_HEAD` cleared by the abort, `.git/index.lock` released by an exiting peer process, a temporary network blip while resolving the worker branch); others are **permanent** for this run (signed-merge requirement, branch-protection rule, hook that inspects merge content). The supervisor cannot reliably classify these from stderr alone, so it does **one in-iteration retry** before declaring the task permanently blocked.
+
+     Capture the verbatim stderr from the failed `git merge --no-commit` call (call it `MERGE_STDERR_1`) before running the abort — the abort's own output overwrites Git's diagnostic if both are written to the same buffer. The unconditional `git merge --abort 2>/dev/null || true` above already cleared any residual `MERGE_HEAD`. Then attempt the merge ONCE more, immediately, in the same Step B iteration:
+
      ```bash
-     CONFLICT_FILES="$(git diff --name-only --diff-filter=U)"
-     git merge --abort
+     # Single in-iteration retry. Any locks/MERGE_HEAD that the first
+     # abort cleared will not block the retry; permanent rejections will
+     # surface again identically.
+     if git merge --no-commit --no-ff --no-edit "ccx/<task_id>"; then
+       git commit --no-edit
+       # Falls into the "Clean dry-run + commit succeeds" outcome.
+     else
+       CONFLICT_FILES_2="$(git diff --name-only --diff-filter=U)"
+       MERGE_STDERR_2="<verbatim stderr of the retry's --no-commit call>"
+       git merge --abort 2>/dev/null || true
+       # Inspect CONFLICT_FILES_2 to decide which permanent branch to take.
+     fi
      ```
-     Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-conflict"`, `notes: "conflict on <CONFLICT_FILES, comma-separated>"`. The worker branch stays intact — the human resolves manually.
+
+     Three terminal states from the retry:
+     1. **Retry succeeds** (clean merge + commit): treat exactly like the "Clean dry-run + commit succeeds" outcome above (`MERGED_COUNT += 1`, append to `MERGED_IDS`, stash `status: "merged" / exit_status: "approved"`). Do NOT add a `notes` entry mentioning the first-attempt failure — the merge is in the integration history at this point; a "we retried" note is reflog territory, not BOARD-row territory.
+     2. **Retry conflicts** (`CONFLICT_FILES_2` non-empty): the first attempt's transient cause cleared, exposing a real file-level conflict. Treat exactly like the "Conflict" outcome above (`status: "blocked" / exit_status: "merge-conflict" / notes: "conflict on <CONFLICT_FILES_2, comma-separated>"`).
+     3. **Retry refuses again** (`CONFLICT_FILES_2` empty AND non-zero exit): the rejection is permanent for this run. Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-aborted"`, `notes: "git merge --no-commit refused without conflicts (retried once): <first 200 chars of MERGE_STDERR_2, single-line>"`. Do NOT set `STOP_DISPATCHING` here — `merge-aborted` is per-merge, not per-supervisor; if a subsequent peer's merge also hits the same refusal, the same handler fires again and the human sees a pattern in P3. The worker branch stays intact for manual investigation.
+
+     Why a single in-iteration retry rather than re-queuing for the next Step B iteration: re-queuing would require a new "approved-but-not-yet-merged" state alongside `RUNNING` and `BLOCKED_IDS`, which complicates exit-condition reasoning and could mask a permanent failure as "the supervisor will get to it eventually". A single immediate retry catches the specific transient causes documented above (locks released within milliseconds, `MERGE_HEAD` cleared by the abort) without inventing a new state. Failures that need more than seconds to clear are correctly classified as `merge-aborted` and surfaced for human triage.
+   - **Dry-run clean but commit fails** (pre-commit hook rejects the merge, signing failure, etc.): the working tree still has `MERGE_HEAD` set and the index holds a successful merge result that was never committed. Run `git merge --abort` to restore the integration branch to its pre-merge state — leaving `MERGE_HEAD` around would make the next iteration's `git merge --no-commit` refuse with "You have not concluded your merge". Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-commit-failed"`, `notes: "merge dry-run clean but commit failed — see supervisor stderr"`. Then handle the **likely Step D commit failure** synchronously, before STOPping the run:
+
+     The same condition that rejected the merge commit (broken pre-commit hook, signing key absent, integration-branch protection, etc.) is overwhelmingly likely to reject the Step D batch BOARD commit too. If Step D fails after the merge-commit-failed branch fires, the in-memory `status: "blocked"` update is lost from the repo — `BOARD.md` stays at `status: "assigned"`, and every future supervisor run skips this task (P1 step 3 excludes `assigned` from `PENDING_POOL`). To avoid stranding the row:
+
+     1. **Write a recovery sidecar synchronously**, BEFORE Step D runs and BEFORE STOP:
+
+        ```
+        REPO_ROOT/.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt
+        ```
+
+        Contents (plain text, append-only, never JSON — humans read this directly):
+        ```
+        Run: <SUPERVISOR_RUN_ID>
+        Cause: merge-commit-failed for <task_id> on integration branch <INTEGRATION>
+        Last git stderr: <verbatim git commit stderr from the failed --no-edit call>
+
+        Required manual recovery:
+        1. Inspect/fix the integration-branch commit hook or signing config that rejected the merge commit.
+        2. Apply this BOARD.md edit by hand (the supervisor's Step D may also fail to commit it):
+           - Set BOARD row id=<task_id> status=blocked, exit_status=merge-commit-failed,
+             notes="merge dry-run clean but commit failed — see <log_path>"
+           - Append <task_id> to BLOCKED_IDS in any pending audit summary.
+        3. Stage and commit BOARD.md once the hook accepts commits again:
+             git add BOARD.md
+             git commit -m "supervisor recovery: mark <task_id> blocked (merge-commit-failed)"
+
+        Worker branch ccx/<task_id> is INTACT and contains the approved diff.
+        ```
+
+        The sidecar uses `SUPERVISOR_RUN_ID` (P0 step 5a) so concurrent supervisor recoveries don't overwrite each other. It is plain `.txt` to dodge the repo's `*.log` ignore rule and so `git status` surfaces it as untracked — the human sees it on the next interactive `git status`. The file is intentionally NOT staged or committed by the supervisor; staging it would re-trigger the same failing commit hook.
+
+     2. **Set the run-wide `STOP_DISPATCHING = true` flag** (initialized to `false` at the start of the scheduling loop alongside `SLOTS` / `RUNNING` / `DISPATCHED`) so Step A stops popping new tasks. Do NOT stop the loop yet — other workers in `RUNNING` may already be in flight (especially likely with `--parallel > 1`), and terminating the supervisor while peers are still working would strand their BOARD rows at `status: "assigned"`, which P1 step 3 excludes from `PENDING_POOL` on every future run. The merge-commit failure is a per-merge-commit symptom — common causes are a `commit-msg` hook rejecting Git's default `Merge branch '...' into <INTEGRATION>` subject, an integration-branch protection rule that blocks merge-shaped commits specifically, or a signing key that is unavailable at the moment of the merge — none of which prevent the supervisor from continuing to **drain** existing workers via Step B. Continuing to drain has three benefits:
+        - Approved peers may merge cleanly (their merges may use a slightly different subject path, or the commit-pipeline issue may be transient and resolve mid-run).
+        - Peers that fail to merge for the same reason get the same treatment (block + append to the recovery sidecar), so the sidecar grows into a complete recovery list rather than reflecting just the first failure.
+        - `no-commit` / `error` peers do not require any commit step at all and can be cleanly classified as `blocked` without re-tripping the broken commit pipeline.
+
+     3. **Continue the scheduling loop.** Step A's slot-fill is gated by `STOP_DISPATCHING == true` — when set, A2 skips outright (no new pops, no new briefs, no new spawns) but A1 still runs to keep `PENDING_POOL` views consistent for P3 reporting. Step B continues draining `RUNNING` exactly as before. Step C still sleeps + iterates. The loop exits via **condition 3** (`STOP_DISPATCHING == true` AND `RUNNING == {}`) once the last in-flight worker drains. Condition 3 is required because A1 keeps `READY` populated from `PENDING_POOL` even when A2 cannot act on it, so condition 1 alone would never fire when there are untouched pending tasks left at the moment the commit pipeline broke — those tasks legitimately stay in `PENDING_POOL` for a future supervisor run to pick up after the human resolves the underlying hook/signing/protection issue.
+
+     4. **Step D runs exactly once at natural loop exit, regardless of how many merge-commit failures accumulated.** Step D's commit subject is `supervisor: update board — merged ..., blocked ...`, which is plausibly accepted by hooks that only reject merge-shaped commits — so Step D may well succeed even when every merge attempt failed. Two outcomes:
+        - **Step D succeeds.** The blocked statuses for every merge-commit-failed task are persisted on the integration branch. The sidecar is obsolete (the Step D commit subject already records every blocked id; the JSONL audit log records each supervisor decision). The supervisor MUST `rm` the sidecar (`rm -f "$REPO_ROOT/.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt"`) before exiting. Leaving it behind would make the file untracked on the integration branch and the next supervisor run would fail P0 step 3's `git status --porcelain=v1 -z` clean-tree gate, even though no manual recovery is actually needed.
+        - **Step D fails.** The sidecar is the only authoritative record of every blocked status and the human-facing recovery instructions. Leave it on disk untouched — this is precisely the case the sidecar exists for; the same broken hook that blocks Step D will also block any committable cleanup, so the sidecar must persist until the human resolves the underlying issue and stages the recovery edits manually. Step D's own commit-failure-recovery clause (further below in this section) handles appending to the same file for any blocked ids that were not yet recorded.
+
+     5. **Final P3 report** prints the absolute sidecar path when the file still exists at exit, plus a one-line summary of how many tasks blocked with `merge-commit-failed`. Omit the sidecar-path line entirely when Step D succeeded and the sidecar was deleted in step 4 above.
+
+   The dry-run does NOT replace the abort-on-conflict guarantee — the conflict-capture order in §3 step 3 below is unchanged. The dry-run adds a bounded "clean merge prepared but not yet committed" window; that window MUST be closed by either `git commit --no-edit` or `git merge --abort` before Step B moves to the next `(task_id, meta)`. Never leave a partial merge state across loop iterations — Step B's own next iteration would observe the residual `MERGE_HEAD` and either fail to start a new merge or compound the unfinalized one.
 
 4. For **no-commit** / **error**: append to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "no-commit"` or `"error"`, `notes: "see .ccx/workers/<task_id>.log"`. (`PENDING_POOL` already has this task removed from Step A step 7; the pool-removal rule requires nothing further here.)
 
@@ -261,7 +355,10 @@ Before the first iteration of the scheduling loop runs Step B2, initialize two i
 
 ### Step C — Sleep and repeat
 
-Sleep 3 seconds (`sleep 3`). Go back to the top of the iteration — **re-evaluate the two exit conditions first** (after A1 recomputes `READY`), then run Steps A → B → B2 in order if neither condition fires. A1 is where newly-unblocked dependents get picked up by a fresh merge; B2 is where supervisor-mode runs drain worker `chat_ask` queues (Discord-only runs skip B2). This iteration shape guarantees the loop cannot spin when either (a) all remaining pending tasks depend on `blocked` predecessors (condition 1 fires once `RUNNING` drains) or (b) `--max-tasks` has been reached with tasks still pending (condition 2 fires once `RUNNING` drains).
+Sleep 3 seconds (`sleep 3`). Go back to the top of the iteration — **re-evaluate all three exit conditions first** (after A1 recomputes `READY`), then run Steps A → B → B2 in order if none of the three conditions fires. A1 is where newly-unblocked dependents get picked up by a fresh merge; B2 is where supervisor-mode runs drain worker `chat_ask` queues (Discord-only runs skip B2). This iteration shape guarantees the loop cannot spin in any of the documented failure modes:
+- (a) all remaining pending tasks depend on `blocked` predecessors → condition 1 fires once `RUNNING` drains.
+- (b) `--max-tasks` has been reached with tasks still pending → condition 2 fires once `RUNNING` drains.
+- (c) `STOP_DISPATCHING` was set by Step B's merge-commit-failed branch (M4) and `PENDING_POOL` still holds untouched tasks → condition 3 fires once `RUNNING` drains. Without checking condition 3 here, A1 keeps `READY` populated from `PENDING_POOL` and the loop would spin forever in this exact failure mode the M4 path is meant to handle.
 
 ### Step D — Batch BOARD.md commit
 
@@ -282,6 +379,13 @@ Commit rules:
 - If `MERGED_IDS` and `BLOCKED_IDS` are both empty AND the audit log was not written this run, skip the commit silently (no-op run).
 - If the only change is the audit log (no merges, no blocks), still commit — the JSONL trail is valuable audit evidence even for a quiet run. Adjust the subject to `supervisor: audit-only run — <N> supervisor decisions`.
 - Never use `git add -A` or `git add .` — explicit paths only. The audit log and `BOARD.md` are the only files the supervisor owns on the integration branch mid-run.
+
+**Commit-failure recovery.** If `git commit` fails (pre-commit hook, signing, branch protection), the in-memory BOARD updates and the audit log are at risk of being lost from the integration history — but `BOARD.md` is already modified on disk by this point and the audit JSONL is already written. To prevent stranded `assigned` rows and orphaned audit lines:
+
+1. Do NOT retry the commit, do NOT skip hooks (`--no-verify` would mask the underlying problem and leave the user with an unsigned/un-hooked commit they did not opt into), do NOT `git reset` the staged paths.
+2. Write/append a recovery sidecar at `REPO_ROOT/.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt` listing every `MERGED_IDS` / `BLOCKED_IDS` row, the audit JSONL path, and the verbatim `git commit` stderr. If the merge-commit-failed branch in Step B already wrote this sidecar, **append** to it (do not overwrite — both records are needed).
+3. Leave `BOARD.md` modified on disk and the audit JSONL on disk so the human can stage and commit them manually after fixing the hook/signing condition. Print the recovery sidecar path and the verbatim instructions to STOP-with-error in the P3 report.
+4. STOP the supervisor run with non-zero exit semantics. The next supervisor run will hit P0 step 3's "clean working tree" check and refuse to start until the human commits or stashes the recovery edits, which is exactly the right gate — there is no safe way to continue dispatching while the integration branch's commit pipeline is broken.
 
 This single batch commit replaces per-task BOARD updates to keep the integration history clean (see §10 of the design doc).
 
@@ -422,6 +526,74 @@ If `ageSec >= perAskDeadlineSec - 3`, skip the decision work and call `chat_supe
 
 Explicit escalation (via `chat_supervisor_escalate`) rather than lost `chat_supervisor_reply` calls keeps the audit log clean: a racing reply would land as `brokerOk: false` (the adapter already resolved the ask), which clutters the JSONL trail without changing the outcome.
 
+### P2.4 — Scope-overlap detection
+
+Step A's overlap gate (A2 step 1a) decides whether `TASK.scope.include` overlaps with any `RUNNING_TASK.scope_include`. Two tasks "overlap" when there is at least one tracked file that both task scopes would include — at that point a parallel dispatch risks producing two worktrees that edit the same file and a merge conflict downstream. The algorithm below errs on the side of serializing: a false-positive overlap defers a task by one Step C cycle (3s); a false-negative lets two workers race the same file.
+
+**Algorithm** — applied to every `RUNNING_TASK` for the popped `TASK`. Stops at the first overlap detected (one match is enough to defer).
+
+1. **Build the candidate file set per task.** For each glob list, invoke `git ls-files` via **direct exec with each glob as its own argv element** — never via a shell-snippet that joins globs into a single string. The shell would expand `*`/`?`/`[…]` against the supervisor's `cwd` (with semantics that differ from Git's: `nullglob` drops unmatched literals, default bash keeps them as literal strings, `failglob` errors out — none of those is what the supervisor wants), so passing glob strings through a shell would silently corrupt overlap detection for any task whose `scope.include` uses real wildcards. Direct exec sidesteps the shell entirely and lets Git perform pathspec resolution itself, against the integration tree, with its own `**` / `*` / class-bracket semantics. This also makes the BOARD glob-string contract narrower: only NUL and newline are forbidden (§P1 step 2), which lines up with the legal Git path character set.
+
+   Build the argv array programmatically (each glob becomes one element); never join globs into a single space-separated string, and never route this call through `sh -c`:
+
+   ```
+   argv = ["git", "-C", REPO_ROOT, "ls-files", "-z", "--"]
+   for glob in TASK.scope.include:
+       argv.append(glob)            # one argv element per glob, NEVER passed through a shell
+   spawn(argv)                      # exec(argv), not exec("sh", "-c", joined_string)
+   ```
+
+   This contract holds regardless of how the tool runtime spells the call — `Bash` tool calls that need overlap detection must build a single-string command that the shell will not re-glob (use a `bash -c` wrapper that quotes via `printf %q` per element if absolutely necessary, but prefer a Node/Python helper that calls `child_process.spawn` / `subprocess.run` with the argv array directly). Documentation snippets that show a copy-pasted `git -C "$REPO_ROOT" ls-files -z -- ...` form are NOT part of the contract and MUST NOT be used at runtime — they exist only to make the intent legible to a human reading the prompt.
+
+   `-z` is required — file paths can contain spaces, tabs, or shell-special characters; newlines must not be relied on as a separator. Parse the NUL-separated output into a set of repo-relative paths. Use `git ls-files` (not `find` or `git ls-tree`) so untracked-but-tracked-after-add files behave consistently with the rest of the supervisor's path logic, and so the `.gitignore` semantics match the integration branch's view.
+   - Run from `REPO_ROOT` via `-C`, not from the worker worktrees — `RUNNING_TASK.scope_include` was captured at dispatch time on the integration branch and reflects the integration tree's contents. Worktree contents have diverged.
+   - Cache per-task results within a single Step A pass (the gate may compare the same `RUNNING_TASK` against several popped candidates). Do NOT cache across passes — the integration tree mutates as merges land in Step B.
+
+2. **Intersect.** If `set(TASK_FILES) ∩ set(RUNNING_TASK_FILES)` is non-empty, the two tasks overlap. Record up to 3 sample paths from the intersection for the deferral notice (sorted ascending so the diagnostic is stable across runs).
+
+3. **Empty-match fallback (two tiers).** Globs may match zero current files (e.g. a brand-new directory the task will create). `git ls-files` returns the empty set for those globs, so the intersection from step 2 is trivially empty and would silently say "no overlap" even when two tasks plan to write into the same future directory. The fallback runs in two tiers; either tier triggering an overlap is sufficient.
+
+   **Normalization (applies to both tiers).** Collapse repeated `/` runs (`a//b` → `a/b`). Do NOT trim leading or trailing whitespace — P1 step 2 explicitly permits whitespace in glob strings (Git allows spaces in committed paths, e.g. `"assets/logo .svg"`), and trimming would silently change which file path the glob refers to and let the gate compare a different path than the BOARD declared. Do NOT case-fold; on case-insensitive filesystems two literally-different globs may still collide, but that is a filesystem-policy edge case the supervisor does not try to resolve.
+
+   **Tier 3a — literal-string equality.** If any normalized glob string from `TASK.scope.include` matches any normalized glob string from `RUNNING_TASK.scope_include` byte-for-byte, the two tasks overlap on that glob string. Record the matching glob string (not a file path) for the deferral notice.
+
+   **Tier 3b — glob-prefix coverage.** Pure literal-string equality misses the common case of broad-vs-narrow patterns over a directory that does not exist yet — `src/**/*.ts` vs `src/foo/*.ts` would both be byte-different and both produce empty `git ls-files` output, yet they obviously overlap once `src/foo/` is created by either worker. To catch this:
+
+   - Compute each normalized glob's **literal prefix**: the longest leading substring containing no Git pathspec metacharacter (`*`, `?`, `[`, `]`). Curly braces (`{`, `}`) are NOT Git pathspec metacharacters — Git pathspecs do not implement brace expansion (that is a shell feature). A BOARD glob like `src/{a,b}/*.ts` matches a file literally named `{a,b}` under `src/`, not files under `src/a/` or `src/b/`. The supervisor does NOT special-case braces and treats them as literal characters; if an operator wrote a brace pattern intending shell-style alternation, that is a BOARD authoring bug they will see at dispatch time when `git ls-files` returns an unexpected (likely empty) set. Examples: `src/**/*.ts` → `src/`; `src/foo/*.ts` → `src/foo/`; `src/foo.ts` → `src/foo.ts` (no metacharacter, the whole string is its prefix); `**/foo.ts` → `` (empty prefix); `[abc]/lib.ts` → `` (leading metacharacter); `src/{a,b}/*.ts` → `src/{a,b}/` (braces are literal — only the trailing `*` is a metacharacter).
+   - Two normalized globs are flagged as overlapping under Tier 3b when ALL of the following hold:
+     1. Glob A and glob B are NOT byte-identical (Tier 3a already covers that case).
+     2. Either glob A or glob B contains a glob metacharacter (two purely-literal paths can only overlap by being identical, which Tier 3a handled — and `git ls-files` would have caught any extant file).
+     3. **At least one of the two prefixes is non-empty.** When both prefixes are empty (both globs lead with `**` or a character class), the prefix algorithm has no usable signal — `**/foo.ts` and `**/*.md` are unrelated future-file patterns, but a naive empty-prefix-equals-empty-prefix match would over-defer them and turn the gate into a near-global mutex for any repo that uses leading-`**` patterns. The principled handling is to skip Tier 3b in that case and let the "still undecidable cases" note (below) cover them; tasks whose scopes both lead with `**` should declare `depends_on` explicitly when they actually conflict.
+     4. One of the prefixes is a path-prefix of the other (treat the prefixes as `/`-separated path segments, so `src/foo/` is a prefix of `src/foo/bar/` but `src/foo` — without trailing slash — is NOT a prefix of `src/foobar/`; normalize each prefix to end with `/` unless it is empty for this comparison). With clause 3 enforcing that at least one prefix is non-empty, this comparison is well-defined.
+     5. The "wider" glob (the one whose prefix is shorter, or the one with metacharacters when the prefixes are equal) actually has a chance of matching paths under the narrower's prefix — proxy: the wider glob contains `**`, OR the segment immediately following the shared prefix in the wider glob is a single `*`, OR the wider glob's prefix equals the narrower's prefix exactly (in which case both globs match files in the same directory).
+   - Record the deferral notice as `glob-prefix overlap: <wider> covers <narrower>` so the human sees which two patterns the gate considered conflicting.
+
+   **Conservative bias.** Both tiers err toward false positives (defer when in doubt) over false negatives (let two workers race the same file). A false positive costs one Step C cycle (3s) of waiting for the running task to drain; a false negative costs a merge-conflict and a `blocked` task. When the prefixes are entirely disjoint (`src/lib/` vs `tests/api/`), no tier fires and the tasks run in parallel as intended. The empty-prefix carve-out in clause 3 above is a deliberate exception to the conservative bias: defer-on-any-leading-`**` would punish broad-pattern repos for no real benefit, so we accept the rare false negative there in exchange for retaining parallelism in the common case.
+
+   **Still undecidable cases.** Pure character-class overlap (`src/[ab]*` vs `src/[bc]*`) is not detected — class-vs-class coverage analysis is undecidable in general. Two-leading-`**` pattern pairs (per clause 3 above) are also not detected by Tier 3b. Tasks that intend to overlap on these patterns should declare `depends_on` explicitly. Document this as a known M4 gap; M5 may revisit if the case turns up in practice. Brace alternation patterns (`src/{a,b}/*.ts`) are not in this list because Git pathspecs do not interpret braces — those globs match literal `{a,b}` paths and so are not a coverage-analysis problem at all (they will simply match the wrong files at dispatch time, which is a BOARD authoring mistake the operator should see and fix).
+
+4. **`scope.exclude` is ignored by the overlap gate.** A file matched by an `include` glob and also by an `exclude` glob is per-task out-of-scope, but the gate's job is parallelism safety — encoding exclude rules into overlap detection would let two tasks claim the same `include` set with mutually exclusive `exclude` filters, then race when one of them edits a file the other thought was off-limits. The conservative policy is: `scope.include` is the contract for which files a task **may** touch; that's what overlap is computed against. If two tasks need disjoint slices of the same directory, model it via separate `include` globs, not via overlapping include + differing exclude.
+
+5. **Failure modes.** `git ls-files` should never fail on a clean integration branch — P1 step 2's pathspec sanity probe has already validated every task's `scope.include` and `scope.exclude` against this exact tree, so any runtime failure here is **not** a pathspec issue. The remaining causes are repo-level: a locked or corrupt `.git/index`, a missing or unreadable object, a filesystem permission revocation between startup and now, or another process holding a write lock. None of these are wait-and-retry transient — they all require human intervention to clear, and silently deferring would either spin forever (because A1 clears `DEFERRED_THIS_PASS` every pass and `READY` keeps re-including the task once `RUNNING` drains, so no exit condition fires) or, worse, produce a false-negative overlap result if the supervisor decided to skip the gate after some retry count.
+
+   The correct response is to **STOP the whole supervisor run immediately** on the first runtime `git ls-files` failure inside the overlap gate, but the STOP MUST be accompanied by a **comprehensive recovery sidecar** so already-`assigned` workers do not get orphaned. P1 step 3 excludes `assigned` rows from `PENDING_POOL` on every future run, and the in-memory `status: "assigned"` BOARD update committed in Step A step 6 is already on the integration branch — without explicit recovery instructions, every in-flight worker becomes invisible to future supervisor runs even after the human resolves the repo issue.
+
+   Concrete sequence on first runtime `ls-files` failure in the gate:
+
+   1. Capture the verbatim stderr from the failed call (`LS_FILES_STDERR`).
+   2. Do **not** attempt Step D. The integration index may be locked or corrupt, so any `git add` / `git commit` would either fail or produce a damaged commit; defer all BOARD/audit persistence to human triage.
+   3. Do **not** attempt to kill the in-flight `claude -p` workers. They are running in their own worktrees on their own branches; the integration-side repo issue does not affect their progress, and killing them would lose their work. Let them continue; the human will classify their final state manually after the repo is fixed.
+   4. Write `REPO_ROOT/.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt` (append if the merge-commit-failed branch already wrote one — both records are needed) with these sections, in this order:
+      - **Cause**: `git ls-files refused inside the M4 overlap gate at <UTC ISO 8601>`. Include `LS_FILES_STDERR` verbatim.
+      - **Already-merged tasks** (`MERGED_IDS`): the integration branch already holds these merges; the BOARD-row updates were stashed in memory but not yet persisted by Step D. List each as `T-<id> — needs BOARD row update to status=merged, exit_status=approved`.
+      - **Already-blocked tasks** (`BLOCKED_IDS` + their stashed BOARD-row updates): same situation; list each with the verbatim `exit_status` and `notes` text the supervisor would have written via Step D.
+      - **In-flight workers** (`RUNNING`): list each as `T-<id> — branch ccx/<id> — worktree <REPO_ROOT>-<id> — log <log_path> — shell <shell_id>`. Tell the operator: "These workers are still alive at STOP time. After fixing the repo issue, inspect each log to determine its final outcome and either run `/ccx:supervisor` again (which will detect the worktree+branch and surface the resulting commit on the next dispatch — assuming the BOARD row is back to `pending`) or manually merge `ccx/<id>` and update the BOARD row from `assigned` → `merged`/`blocked`."
+      - **Untouched pending tasks** (`PENDING_POOL` minus the IDs already in MERGED/BLOCKED/RUNNING): list each as `T-<id> — pending, untouched by this run`. These need no manual action; a future supervisor run will pick them up automatically once the repo is healthy.
+      - **Manual remediation steps**: a numbered checklist starting with "Resolve the underlying repo issue (locked index, permissions, corruption — see stderr above)", then "Manually apply the BOARD-row updates from the merged/blocked sections above", then "For each in-flight worker, decide based on its log".
+   5. Print the absolute sidecar path, the verbatim `LS_FILES_STDERR`, and a one-line summary `M4 overlap gate aborted: <count> merged, <count> blocked, <count> in-flight workers; see <sidecar path>` to the user. STOP with a non-zero exit.
+
+The gate intentionally does NOT enumerate the cross product of every `READY` task pair — only the popped candidate against currently `RUNNING` tasks. Two `READY` tasks that overlap with each other but neither with `RUNNING` will both be popped sequentially: the first one transitions into `RUNNING`, then the second is checked against it on the inner-loop's next iteration. This is correct because dispatch is sequential within one Step A pass — there is no point at which two `READY` tasks become `RUNNING` simultaneously.
+
 ---
 
 ## Phase P3: Report
@@ -429,7 +601,13 @@ Explicit escalation (via `chat_supervisor_escalate`) rather than lost `chat_supe
 Print a structured final summary:
 
 - **Merged** (`<count>`): list `T-<id>` — `<title>` — `<duration>`.
-- **Blocked** (`<count>`): list `T-<id>` — `<exit_status>` — log path (`.ccx/workers/T-<id>.log`). Blocked reasons: `stale-artifact | spawn-error | merge-conflict | no-commit | error`.
+- **Blocked** (`<count>`): list `T-<id>` — `<exit_status>` — log path (`.ccx/workers/T-<id>.log`). Blocked reasons: `stale-artifact | spawn-error | merge-conflict | merge-aborted | merge-commit-failed | no-commit | error`. The two M4-specific reasons:
+  - `merge-aborted`: `git merge --no-commit --no-ff` refused the merge with no unmerged paths (pre-merge-commit hook rejection, branch protection, residual MERGE_HEAD, unreachable object). The supervisor does NOT set `STOP_DISPATCHING` here — failures of this shape are usually per-merge, so the loop keeps draining and other peers can still merge.
+  - `merge-commit-failed`: the pre-merge dry-run reported clean but `git commit --no-edit` rejected the merge (typically a pre-commit hook on the integration branch); the supervisor sets `STOP_DISPATCHING` so no new workers spawn, drains existing `RUNNING` peers via Step B, then exits via condition 3. A recovery sidecar at `.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt` is written when the same condition is likely to break the Step D batch BOARD commit.
+- **Stranded in `PENDING_POOL`** (informational): tasks whose deps were met but were never dispatched before the loop exited. Report each row with the reason it stayed pending so the human knows what follow-up is needed. Source these reasons from the run-level state (`EVER_DEFERRED_BY_SCOPE`, `STOP_DISPATCHING`, in-memory BOARD `depends_on` resolution) — `DEFERRED_THIS_PASS` is intentionally cleared every A1 pass and is NOT a valid source for P3.
+  - `T-<id> — scope-deferred`: `<id>` is in `EVER_DEFERRED_BY_SCOPE`. The M4 scope-overlap gate deferred this task on at least one Step A pass because a `RUNNING` task held an overlapping file set, and no slot ever cleared into a non-overlapping window before the loop exited (typically because `--max-tasks` was reached, `STOP_DISPATCHING` was set, or all conflicting peers merged after this pass's A1 had already moved on). Re-run the supervisor once the conflicting ids merge.
+  - `T-<id> — deferred-by-stop-dispatching`: exit condition 3 (M4 — see Step B's merge-commit-failed branch) fired and the loop drained `RUNNING` without dispatching this task. The integration-branch commit pipeline rejected at least one merge commit during the run; resolve the underlying hook/signing/protection issue (see the recovery sidecar referenced below if the run produced one) and re-run the supervisor to pick this task back up.
+  - `T-<id> — deps-blocked`: the task's `depends_on` set still points at non-`merged` ids in the in-memory BOARD state at exit. Surface the unmet dep ids; this is the same data the "Not ready (deps unmet)" bullet reports above and is included here for completeness when the same task is also `scope-deferred` or `deferred-by-stop-dispatching`.
 - **Not ready (deps unmet)**: list `T-<id>` with its pending deps.
 - **Still assigned/running** — only non-empty if the loop exited via `--max-tasks` while workers were still running. Step C waits on RUNNING, so this should stay empty; guard against it in the report anyway.
 - **Supervisor audit** (M3 only, when `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` exists and the run is in supervisor mode): parse every JSONL line in that file (no timestamp filter needed — the per-run filename already isolates this run's decisions from any concurrent supervisor) and summarize counts per `decision` (`reply` / `escalate`) and per `source` (`brief` / `direction` / `worker-history` / `none`). Also print the in-memory `foreignAsksSkipped` counter — asks this run observed on the broker but did NOT own (another ccx session or not-yet-attributed); a non-zero value is informational, not a failure. Include the absolute path to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can grep it for deeper auditing. If no asks were handled this run (file absent AND no foreign skips), print `no worker asks this run` and move on — absence is not an error.
@@ -453,16 +631,17 @@ Print a final BOARD.md snapshot (the `## Tasks` YAML block) so the user can see 
 |---------|-----------|
 | Broker supervisor adapter (worker `chat_ask` interception) | M2 — shipped |
 | Autonomous answering from brief `## Decisions` / BOARD direction / merge history | M3 — shipped |
-| Scope-glob overlap parallelism gate | M4 |
-| Pre-merge conflict dry-run before committing the merge | M4 |
+| Scope-glob overlap parallelism gate | M4 — shipped |
+| Pre-merge conflict dry-run before committing the merge | M4 — shipped |
 | Stuck-exit auto-revise brief and re-dispatch | M5 |
 | Supervisor resume after session close | open |
 | Worker budget cap tuning (`--worker-loops` default) | §14 of design doc |
 
-Do not add the deferred rows above to this command — they are tracked separately in `docs/supervisor-design.md`. The current contract is: `BOARD.md` → briefs → dispatch → poll completions → drain supervisor asks (autonomous reply or escalate) → naive merge → BOARD update → audit report.
+Do not add the deferred rows above to this command — they are tracked separately in `docs/supervisor-design.md`. The current contract is: `BOARD.md` → briefs → dispatch (with scope-overlap gate) → poll completions → drain supervisor asks (autonomous reply or escalate) → pre-merge dry-run → BOARD update → audit report.
 
-### How M2 and M3 work together at runtime
+### How M2 / M3 / M4 work together at runtime
 
 - M2 ships the broker plumbing (`plugins/ccx/mcp/ccx-chat/adapters/supervisor.mjs`, `backend: "supervisor"` config option, and the `chat_supervisor_{poll,reply,escalate,close}` MCP tools). With `backend: "supervisor"` in `~/.claude/ccx-chat/config.json`, worker `chat_ask` calls queue in the broker and auto-escalate to Discord after `supervisor.autoEscalateAfterSec` seconds (default 60).
 - M3 ships the supervisor-side polling (`Step B2`) and the match-confidence rubric (`§P2.3`). When the broker is in Discord-only mode OR the broker tool is unavailable, Step B2 is a no-op and worker asks reach humans via the broker's own 60s auto-escalate timer, preserving the M1 behavior.
+- M4 adds two independent gates that share no state: the scope-overlap gate (`Step A2 step 1a` + `§P2.4`) defers candidate dispatches whose `scope.include` shares any tracked file with a `RUNNING` task's snapshotted `scope_include`, and the pre-merge dry-run (`Step B step 3`) wraps every approved-worker merge in a `git merge --no-commit --no-ff` / `git commit --no-edit` pair so conflict detection happens before commit creation. Neither gate touches the audit log or the broker; both are pure repo-state operations.
 - The audit log (`.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl`) is append-only JSONL, owned by the supervisor session, and committed by the supervisor's Step D batch commit alongside `BOARD.md`. **Add `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` to the Step D staging set** so the run's decisions land on the integration branch atomically with the merge/block outcomes. Never truncate the file; never edit past lines.
