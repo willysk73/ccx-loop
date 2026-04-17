@@ -1,10 +1,16 @@
 {
+  "_comment_backend": "Set to 'discord' (default) or 'supervisor' to route worker chat_ask through /ccx:supervisor first. Supervisor mode also requires the 'supervisor' block below; Discord fields stay required because they're the fallback.",
   "backend": "discord",
   "discord": {
     "token": "PASTE_BOT_TOKEN_HERE",
     "channelId": "PASTE_CHANNEL_ID_HERE",
     "allowedUserIds": ["PASTE_YOUR_DISCORD_USER_ID_HERE"],
     "commandPrefix": "!ccx"
+  },
+  "_comment_supervisor": "Only read when backend === 'supervisor'. autoEscalateAfterSec is the grace period before an unanswered ask auto-forwards to Discord (default 60, clamp 5..3600).",
+  "supervisor": {
+    "fallback": "discord",
+    "autoEscalateAfterSec": 60
   },
   "ask": {
     "defaultTimeoutSec": 900

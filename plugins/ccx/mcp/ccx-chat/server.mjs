@@ -186,6 +186,49 @@ const TOOLS = [
       required: ['sessionId'],
     },
   },
+  {
+    name: 'chat_supervisor_poll',
+    description: 'Supervisor-only. List chat_ask calls queued for supervisor handling. Returns { asks: [{ askId, sessionId, prompt, timeoutSec, receivedAt, ageSec }] }. Errors if the broker is not in supervisor mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'chat_supervisor_reply',
+    description: 'Supervisor-only. Answer a pending chat_ask directly (worker receives { reply, source: "supervisor-auto" }). Returns { ok: true } if the ask was still pending.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        askId: { type: 'string' },
+        reply: { type: 'string' },
+      },
+      required: ['askId', 'reply'],
+    },
+  },
+  {
+    name: 'chat_supervisor_escalate',
+    description: 'Supervisor-only. Forward a pending chat_ask to the fallback (Discord) — a human answers on Discord and the reply flows back to the worker. Returns { ok: true } if the ask was still pending.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        askId: { type: 'string' },
+      },
+      required: ['askId'],
+    },
+  },
+  {
+    name: 'chat_supervisor_close',
+    description: 'Supervisor-only. Decline a pending chat_ask — worker receives { reply: null, source: "closed" } and its chat_ask failure path runs (falls back to AskUserQuestion).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        askId: { type: 'string' },
+      },
+      required: ['askId'],
+    },
+  },
 ];
 
 const server = new Server(
@@ -203,6 +246,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     chat_ask: 'ask',
     chat_set_phase: 'setPhase',
     chat_close: 'close',
+    chat_supervisor_poll: 'supervisorPoll',
+    chat_supervisor_reply: 'supervisorReply',
+    chat_supervisor_escalate: 'supervisorEscalate',
+    chat_supervisor_close: 'supervisorClose',
   }[name];
   if (!op) {
     return {

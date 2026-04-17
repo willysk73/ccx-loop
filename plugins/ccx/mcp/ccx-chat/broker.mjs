@@ -3,6 +3,7 @@ import { createServer } from 'node:net';
 import { readFile, writeFile, unlink, appendFile, open } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { DiscordAdapter } from './adapters/discord.mjs';
+import { SupervisorAdapter } from './adapters/supervisor.mjs';
 import { Registry } from './registry.mjs';
 import {
   SOCK,
@@ -30,9 +31,11 @@ async function log(kind, data) {
 async function loadConfig() {
   const raw = await readFile(CONFIG_FILE, 'utf8');
   const cfg = JSON.parse(raw);
-  if (cfg.backend !== 'discord') {
+  if (cfg.backend !== 'discord' && cfg.backend !== 'supervisor') {
     throw new Error(`unsupported backend: ${cfg.backend}`);
   }
+  // Discord is always required — either as the sole backend or as the
+  // supervisor backend's fallback for announcements + escalated asks.
   if (!cfg.discord?.token || !cfg.discord?.channelId) {
     throw new Error('config.discord.{token,channelId} are required');
   }
@@ -44,6 +47,18 @@ async function loadConfig() {
   const bad = cfg.discord.allowedUserIds.filter((id) => typeof id !== 'string' || !/^\d{5,32}$/.test(id));
   if (bad.length) {
     throw new Error(`config.discord.allowedUserIds contains invalid entries: ${JSON.stringify(bad)} (expected numeric Discord snowflakes as strings)`);
+  }
+  if (cfg.backend === 'supervisor') {
+    const sup = cfg.supervisor ?? {};
+    if (sup.fallback !== 'discord') {
+      throw new Error('config.supervisor.fallback must be "discord" (only fallback supported in M2)');
+    }
+    if (sup.autoEscalateAfterSec !== undefined) {
+      const v = sup.autoEscalateAfterSec;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 5 || v > 3600) {
+        throw new Error('config.supervisor.autoEscalateAfterSec must be a number between 5 and 3600');
+      }
+    }
   }
   return cfg;
 }
@@ -259,6 +274,7 @@ async function main() {
       }
       sessionMeta.delete(sessionId);
     }
+    supervisor?.dropSession(sessionId);
     markCancelled(sessionId, reason);
     registry.close(sessionId);
     await registry.save();
@@ -409,7 +425,14 @@ async function main() {
     }
   }
 
+  // `adapter` is the outward-facing sender used for register/close/send/smoketest
+  // announcements (it may be the SupervisorAdapter, which delegates to the
+  // fallback). `fallbackAdapter` is always the Discord adapter — the `ask` op
+  // uses it directly for escalated / Discord-mode posts. `supervisor` is the
+  // SupervisorAdapter instance when backend === "supervisor"; null otherwise.
   let adapter = null;
+  let fallbackAdapter = null;
+  let supervisor = null;
 
   const ops = {
     async ping() {
@@ -463,23 +486,105 @@ async function main() {
         Math.max(10, timeoutSec ?? config.ask?.defaultTimeoutSec ?? DEFAULT_ASK_TIMEOUT_SEC),
       );
       const askId = `${sessionId}-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
-      const ids = await adapter.sendTo(
-        session.channelId,
-        `${colorOf(session)} ❓ \`#${session.id}\` ${prompt}\n_Reply to this message (timeout ${timeout}s)._`,
-      );
-      for (const id of ids) {
-        messageToSession.set(id, session.id);
-        messageToAsk.set(id, { sessionId, askId });
-      }
-      const timer = setTimeout(() => {
-        const idx = meta.pendingAsks.findIndex((a) => a.askId === askId);
-        if (idx >= 0) {
-          const removed = meta.pendingAsks.splice(idx, 1)[0];
-          for (const mid of removed.messageIds ?? []) messageToAsk.delete(mid);
-          respond({ ok: true, result: { reply: null, source: 'timeout' } });
+
+      const startOuterTimer = (initialMessageIds) => {
+        const pending = { askId, respond, timer: null, messageIds: initialMessageIds };
+        pending.timer = setTimeout(() => {
+          const idx = meta.pendingAsks.findIndex((a) => a.askId === askId);
+          if (idx >= 0) {
+            const removed = meta.pendingAsks.splice(idx, 1)[0];
+            for (const mid of removed.messageIds ?? []) messageToAsk.delete(mid);
+            supervisor?.dropAsk(askId);
+            respond({ ok: true, result: { reply: null, source: 'timeout' } });
+          }
+        }, timeout * 1000);
+        meta.pendingAsks.push(pending);
+        return pending;
+      };
+
+      // `pendingRef` is provided in supervisor mode (the ask already lives in
+      // meta.pendingAsks; attach messageIds + routing atomically after send).
+      // In Discord-only mode it is omitted — the caller creates the pending
+      // entry right after this returns, with the ids as its initial
+      // messageIds, so there is no pre-existing entry to update.
+      const postToFallback = async (tag, pendingRef) => {
+        const header = tag
+          ? `${colorOf(session)} ❓ \`#${session.id}\` ${tag} ${prompt}`
+          : `${colorOf(session)} ❓ \`#${session.id}\` ${prompt}`;
+        const ids = await fallbackAdapter.sendTo(
+          session.channelId,
+          `${header}\n_Reply to this message (timeout ${timeout}s)._`,
+        );
+        // Single synchronous block from here: set messageIds on the pending
+        // entry (supervisor mode) and populate the global routing maps so a
+        // concurrent resolve/timeout/cancel path sees a consistent view. If
+        // the ask was already resolved while the send was in flight (outer
+        // timer fired, session cancelled), skip routing-map population —
+        // otherwise messageToAsk would hold entries that no cleanup path
+        // removes, and later Discord replies to the escalated message would
+        // land on a non-existent ask and surface the confusing "no pending
+        // question right now" message.
+        if (pendingRef) {
+          const stillPending = meta.pendingAsks.some((a) => a.askId === askId);
+          if (!stillPending) return ids;
+          pendingRef.messageIds = ids;
         }
-      }, timeout * 1000);
-      meta.pendingAsks.push({ askId, respond, timer, messageIds: ids });
+        for (const id of ids) {
+          messageToSession.set(id, session.id);
+          messageToAsk.set(id, { sessionId, askId });
+        }
+        return ids;
+      };
+
+      if (supervisor) {
+        // Supervisor mode: register the pending ask immediately (outer timer
+        // covers the whole wait, including any later escalation to Discord),
+        // then hand the ask to the supervisor adapter. Supervisor must call
+        // supervisorReply / supervisorEscalate / supervisorClose, or the
+        // adapter's auto-timer fires and escalates to Discord anyway.
+        const pending = startOuterTimer([]);
+        const registerWithSupervisor = () => {
+          supervisor.enqueue({
+            askId,
+            sessionId,
+            channelId: session.channelId,
+            prompt,
+            timeoutSec: timeout,
+            onReply: ({ reply, source }) => {
+              resolveAsk(session, { reply, source }, askId);
+            },
+            onEscalate: ({ auto }) => {
+              const tag = auto ? '⏲️ auto-escalated' : '↗️ escalated';
+              postToFallback(tag, pending)
+                .catch((err) => {
+                  log('supervisor-escalate-error', err.message);
+                  // Fallback send failed (e.g. Discord flaky). Don't silently
+                  // drop the ask: re-enqueue so supervisor.poll still surfaces
+                  // it and the supervisor can retry escalate / close / reply.
+                  // Guard against re-enqueueing after the outer timer already
+                  // fired — that would leave a ghost entry with no receiver.
+                  const stillPending = meta.pendingAsks.some((a) => a.askId === askId);
+                  if (!stillPending) return;
+                  try {
+                    registerWithSupervisor();
+                  } catch (e) {
+                    log('supervisor-reenqueue-error', e.message);
+                  }
+                });
+            },
+          });
+        };
+        registerWithSupervisor();
+        // Pending registered; outer timer running. `pending` is referenced so
+        // linters/compilers see it used.
+        void pending;
+      } else {
+        // Discord-only mode: preserve the original semantics where the outer
+        // timer starts AFTER a successful sendTo. If sendTo throws, nothing
+        // is registered and the caller gets an `ok: false, error`.
+        const ids = await postToFallback();
+        startOuterTimer(ids);
+      }
       return undefined;
     },
     async setPhase({ sessionId, phase }) {
@@ -510,11 +615,31 @@ async function main() {
         }
         sessionMeta.delete(sessionId);
       }
+      supervisor?.dropSession(sessionId);
       registry.close(sessionId);
       clearCancelled(sessionId);
       await registry.save();
       await announceSession({ ...session, id: session.id }, status ?? 'closed');
       return { ok: true };
+    },
+    async supervisorPoll() {
+      if (!supervisor) throw new Error('broker is not in supervisor mode');
+      return { asks: supervisor.poll() };
+    },
+    async supervisorReply({ askId, reply }) {
+      if (!supervisor) throw new Error('broker is not in supervisor mode');
+      if (!askId) throw new Error('supervisorReply: askId is required');
+      return { ok: supervisor.reply(askId, reply) };
+    },
+    async supervisorEscalate({ askId }) {
+      if (!supervisor) throw new Error('broker is not in supervisor mode');
+      if (!askId) throw new Error('supervisorEscalate: askId is required');
+      return { ok: supervisor.escalate(askId) };
+    },
+    async supervisorClose({ askId }) {
+      if (!supervisor) throw new Error('broker is not in supervisor mode');
+      if (!askId) throw new Error('supervisorClose: askId is required');
+      return { ok: supervisor.close(askId) };
     },
     async smoketest({ text } = {}) {
       const ids = await adapter.send(text ?? '✅ ccx-chat smoke test — Discord bridge is live.');
@@ -581,16 +706,31 @@ async function main() {
   await log('listen', SOCK);
 
   // --- Discord: login only after socket is ours ---
-  adapter = new DiscordAdapter({
+  fallbackAdapter = new DiscordAdapter({
     config: config.discord,
     log: (k, e) => log(`discord-${k}`, e?.message ?? e),
     onMessage: (m) => onChatMessage(m).catch((e) => log('onMessage', e.message)),
     onCommand: (c) => onChatCommand(c).catch((e) => log('onCommand', e.message)),
   });
-  await adapter.start();
+  await fallbackAdapter.start();
+
+  if (config.backend === 'supervisor') {
+    supervisor = new SupervisorAdapter({
+      fallback: fallbackAdapter,
+      log: (k, e) => log(k, e?.message ?? e),
+      autoEscalateAfterSec: config.supervisor?.autoEscalateAfterSec,
+    });
+    await supervisor.start();
+    // In supervisor mode, announcements (register/close/send/smoketest) still
+    // go to Discord; SupervisorAdapter.sendTo/send delegate to the fallback.
+    adapter = supervisor;
+  } else {
+    adapter = fallbackAdapter;
+  }
+
   discordReady = true;
   discordReadyResolve();
-  await log('ready', `broker up, pid=${process.pid}`);
+  await log('ready', `broker up, backend=${config.backend}, pid=${process.pid}`);
 
   if (registry.list().length) {
     const lines = registry.list().map(formatSessionLine).join('\n');
@@ -605,7 +745,8 @@ async function main() {
     log('shutdown', signal).catch(() => {});
     try {
       server.close();
-      if (adapter) await adapter.stop();
+      if (supervisor) await supervisor.stop().catch(() => {});
+      if (fallbackAdapter) await fallbackAdapter.stop().catch(() => {});
       await unlink(SOCK).catch(() => {});
       await unlink(PID_FILE).catch(() => {});
       await unlink(LOCK_FILE).catch(() => {});

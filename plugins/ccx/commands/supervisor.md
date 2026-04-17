@@ -349,7 +349,7 @@ Print a final BOARD.md snapshot (the `## Tasks` YAML block) so the user can see 
 
 | Feature | Milestone |
 |---------|-----------|
-| Broker supervisor adapter (worker `chat_ask` interception) | M2 |
+| Broker supervisor adapter (worker `chat_ask` interception) | M2 — shipped (plumbing only; see below) |
 | Autonomous answering from brief `## Decisions` / BOARD direction | M3 |
 | Scope-glob overlap parallelism gate | M4 |
 | Pre-merge conflict dry-run before committing the merge | M4 |
@@ -358,3 +358,7 @@ Print a final BOARD.md snapshot (the `## Tasks` YAML block) so the user can see 
 | Worker budget cap tuning (`--worker-loops` default) | §14 of design doc |
 
 Do not add any of these features to M1. The M1 contract is: `BOARD.md` → briefs → dispatch → poll → naive merge → BOARD update.
+
+### Notes on M2 — broker supervisor adapter
+
+M2 ships the broker plumbing (`plugins/ccx/mcp/ccx-chat/adapters/supervisor.mjs`, `backend: "supervisor"` config option, and `chat_supervisor_poll / reply / escalate / close` MCP tools). With `backend: "supervisor"` in `~/.claude/ccx-chat/config.json`, worker `chat_ask` calls queue in the broker and auto-escalate to Discord after `supervisor.autoEscalateAfterSec` seconds (default 60). The M1 supervisor slash command above does NOT yet poll these asks — auto-escalate keeps things working; autonomous answering lives in M3.
