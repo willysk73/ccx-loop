@@ -2,6 +2,7 @@
 import { createServer } from 'node:net';
 import { readFile, writeFile, unlink, appendFile, open } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { basename } from 'node:path';
 import { DiscordAdapter } from './adapters/discord.mjs';
 import { SupervisorAdapter } from './adapters/supervisor.mjs';
 import { Registry } from './registry.mjs';
@@ -81,6 +82,43 @@ function colorOf(session) {
   return session.color ?? hashColor(session.id);
 }
 
+// Disambiguates concurrent ccx sessions across different repos in Discord.
+// basename keeps the prefix short and never leaks absolute paths (the user
+// runs many sessions like /home/will/Repositories/<repo>; broadcasting the
+// full path was raised as a privacy concern). When two live sessions in
+// the SAME Discord channel share the same basename — e.g. /src/foo/app and
+// /work/bar/app both render as `app` — fall back to `<parent>/<basename>`
+// for both so watchers in that channel can still tell them apart. The
+// collision check is intentionally scoped to `session.channelId`: a repo
+// with the same basename live in a different channel is not ambiguous to
+// either set of watchers and adding the parent prefix there would just
+// leak extra path context for no disambiguation benefit. Pass the registry
+// so the collision check sees every other live session in the channel.
+function repoTag(session, registry) {
+  if (!session?.cwd) return null;
+  const name = basename(session.cwd);
+  if (!name || name === '.' || name === '/') return null;
+  const peers = registry && session.channelId
+    ? registry.listForChannel(session.channelId)
+    : [];
+  const collides = peers.some((other) => {
+    if (other.id === session.id) return false;
+    if (!other.cwd) return false;
+    return basename(other.cwd) === name;
+  });
+  if (collides) {
+    const parent = basename(session.cwd.replace(/\/[^/]+\/?$/, ''));
+    if (parent && parent !== '.' && parent !== '/') {
+      return `\`[${parent}/${name}]\``;
+    }
+  }
+  return `\`[${name}]\``;
+}
+
+function joinNonNull(...parts) {
+  return parts.filter((p) => p != null && p !== '').join(' ');
+}
+
 // Sequential assignment per channel: the first colour not in use by another
 // live session on the same channel. Compare against the *visible* colour
 // (colorOf), not just the persisted field — sessions recovered from snapshots
@@ -97,11 +135,13 @@ function pickColor(channelId, registry) {
   return free ?? null;
 }
 
-function formatSessionLine(s) {
+function formatSessionLine(s, registry) {
   const age = humanAge(Date.parse(s.createdAt));
   const branch = s.branch ? ` · ${s.branch}` : '';
   const tag = s.recovered ? ' (recovered)' : '';
-  return `${colorOf(s)} \`#${s.id}\`${branch} · ${s.phase} · ${age}${tag} — ${s.label}`;
+  const repo = repoTag(s, registry);
+  const head = joinNonNull(colorOf(s), repo, `\`#${s.id}\``);
+  return `${head}${branch} · ${s.phase} · ${age}${tag} — ${s.label}`;
 }
 
 function humanAge(tsMs) {
@@ -287,9 +327,10 @@ async function main() {
 
   async function announceSession(session, verb) {
     const color = colorOf(session);
+    const repo = repoTag(session, registry);
     const text = verb === 'open'
-      ? `${color} 🟢 ccx session opened\n${formatSessionLine(session)}`
-      : `${color} 🔴 ccx session closed \`#${session.id}\` — ${verb}`;
+      ? `${color} 🟢 ccx session opened\n${formatSessionLine(session, registry)}`
+      : `${joinNonNull(color, repo)} 🔴 ccx session closed \`#${session.id}\` — ${verb}`;
     try {
       const ids = await adapter.sendTo(session.channelId, text);
       for (const id of ids) messageToSession.set(id, session.id);
@@ -366,7 +407,7 @@ async function main() {
         await reply('No active ccx sessions. Start one with `/ccx:loop` to connect.');
         return;
       } else {
-        const lines = active.map(formatSessionLine).join('\n');
+        const lines = active.map((s) => formatSessionLine(s, registry)).join('\n');
         await reply(
           `Which session? ${active.length} active — reply to a session message, prefix with \`#<id>\`, or \`!ccx focus <id>\`.\n${lines}`,
         );
@@ -403,7 +444,7 @@ async function main() {
         }
         const focus = registry.getFocus(channelId);
         const header = focus ? `Focus: \`#${focus}\`\n` : '';
-        await reply(`${header}${list.map(formatSessionLine).join('\n')}`);
+        await reply(`${header}${list.map((s) => formatSessionLine(s, registry)).join('\n')}`);
         return;
       }
       case 'cancel': {
@@ -499,7 +540,7 @@ async function main() {
       }, { exclude: registry.cancelled });
       await registry.save();
       try {
-        const text = `${colorOf(session)} 🟢 ccx session opened\n${formatSessionLine(session)}`;
+        const text = `${colorOf(session)} 🟢 ccx session opened\n${formatSessionLine(session, registry)}`;
         const ids = await adapter.sendTo(session.channelId, text);
         for (const id of ids) messageToSession.set(id, session.id);
       } catch (err) {
@@ -514,9 +555,9 @@ async function main() {
       const session = registry.get(sessionId);
       if (!session) throw new Error(`unknown session ${sessionId}`);
       const color = colorOf(session);
-      const prefix = session.branch
-        ? `${color} \`#${session.id}\` \`${session.branch}\``
-        : `${color} \`#${session.id}\``;
+      const repo = repoTag(session, registry);
+      const branch = session.branch ? `\`${session.branch}\`` : null;
+      const prefix = joinNonNull(color, repo, `\`#${session.id}\``, branch);
       const ids = await adapter.sendTo(session.channelId, `${prefix} ${text}`);
       for (const id of ids) messageToSession.set(id, session.id);
       return { messageIds: ids };
@@ -553,9 +594,11 @@ async function main() {
       // entry right after this returns, with the ids as its initial
       // messageIds, so there is no pre-existing entry to update.
       const postToFallback = async (tag, pendingRef) => {
+        const repo = repoTag(session, registry);
+        const headHead = joinNonNull(colorOf(session), repo);
         const header = tag
-          ? `${colorOf(session)} ❓ \`#${session.id}\` ${tag} ${prompt}`
-          : `${colorOf(session)} ❓ \`#${session.id}\` ${prompt}`;
+          ? `${headHead} ❓ \`#${session.id}\` ${tag} ${prompt}`
+          : `${headHead} ❓ \`#${session.id}\` ${prompt}`;
         const ids = await fallbackAdapter.sendTo(
           session.channelId,
           `${header}\n_Reply to this message (timeout ${timeout}s)._`,
@@ -828,7 +871,7 @@ async function main() {
   await log('ready', `broker up, backend=${config.backend}, pid=${process.pid}`);
 
   if (registry.list().length) {
-    const lines = registry.list().map(formatSessionLine).join('\n');
+    const lines = registry.list().map((s) => formatSessionLine(s, registry)).join('\n');
     try {
       await adapter.send(`♻️ ccx broker restarted. ${registry.list().length} session(s) recovered (pending questions abandoned):\n${lines}`);
     } catch (err) {

@@ -1,21 +1,21 @@
 ---
-description: "Orchestrate N parallel /ccx:loop workers from BOARD.md — M5: dispatch + autonomous chat_ask + scope-overlap gate + pre-merge dry-run + stuck-exit auto-revise"
-argument-hint: "[--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--dry-run]"
-allowed-tools: Bash, BashOutput, Read, Write, Edit, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate, mcp__ccx-chat__chat_supervisor_poll, mcp__ccx-chat__chat_supervisor_reply, mcp__ccx-chat__chat_supervisor_escalate, mcp__ccx-chat__chat_supervisor_close, mcp__ccx-chat__chat_supervisor_recent_closures
+description: "Orchestrate N parallel /ccx:loop workers from BOARD.md — M5 + pre-M6 hotfixes: dispatch + autonomous chat_ask + scope-overlap gate + pre-merge squash + stuck-exit auto-revise + optional Discord presence"
+argument-hint: "[--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--chat] [--dry-run]"
+allowed-tools: Bash, BashOutput, Read, Write, Edit, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate, mcp__ccx-chat__chat_register, mcp__ccx-chat__chat_send, mcp__ccx-chat__chat_set_phase, mcp__ccx-chat__chat_close, mcp__ccx-chat__chat_supervisor_poll, mcp__ccx-chat__chat_supervisor_reply, mcp__ccx-chat__chat_supervisor_escalate, mcp__ccx-chat__chat_supervisor_close, mcp__ccx-chat__chat_supervisor_recent_closures
 ---
 
 # /ccx:supervisor — Parallel Worker Orchestrator (M5)
 
-One human drives N parallel `/ccx:loop` workers from a shared `BOARD.md`. Each task runs in its own git worktree, gets its own brief file, and merges back into the integration branch on approval. Worker `chat_ask` calls are intercepted by the broker; the supervisor session answers from the brief / BOARD / merge history when possible, escalating to Discord only when no deterministic answer fits. Tasks whose scope globs touch overlapping files are serialized at dispatch time so concurrent worktrees do not produce conflicting merges, and every merge is staged via a `--no-commit` dry-run before it is finalized. When a worker exits via stuck-finding detection, the supervisor prompts the human once for guidance, appends that guidance to the brief's `## Decisions` section, and re-dispatches the same task one time before giving up.
+One human drives N parallel `/ccx:loop` workers from a shared `BOARD.md`. Each task runs in its own git worktree, gets its own brief file, and merges back into the integration branch on approval. Worker `chat_ask` calls are intercepted by the broker; the supervisor session answers from the brief / BOARD / merge history when possible, escalating to Discord only when no deterministic answer fits. Tasks whose scope globs touch overlapping files are serialized at dispatch time so concurrent worktrees do not produce conflicting merges, and every merge is staged via a `git merge --squash` dry-run before being finalized as a single supervisor-authored `T-<id>: <title>` commit. When a worker exits via stuck-finding detection, the supervisor prompts the human once for guidance, appends that guidance to the brief's `## Decisions` section, and re-dispatches the same task one time before giving up.
 
 Raw arguments: `$ARGUMENTS`
 
 **Milestones shipped** (see §13 of `docs/supervisor-design.md`):
 
-- **M1 — dispatch.** `BOARD.md` → briefs → `claude -p` workers → naive `--no-ff` merge → batch BOARD update.
+- **M1 — dispatch.** `BOARD.md` → briefs → `claude -p` workers → naive merge (originally `--no-ff`; switched to `--squash` in pre-M6 §15.1 — see Step B step 3) → batch BOARD update.
 - **M2 — broker supervisor adapter.** `backend: "supervisor"` in `~/.claude/ccx-chat/config.json` queues worker asks in the broker and exposes `chat_supervisor_{poll,reply,escalate,close}` MCP tools, with a per-ask auto-escalate timer as the no-supervisor-session fallback.
 - **M3 — autonomous answering.** `/ccx:supervisor` polls the broker's supervisor queue every scheduling iteration. For each pending ask it consults the task brief's `## Decisions` table, BOARD `## Direction`, and the integration branch's merge-commit history. A confident deterministic match → `chat_supervisor_reply`; otherwise → `chat_supervisor_escalate` (human answers on Discord). Every supervisor decision is appended as JSONL to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can audit after the fact.
-- **M4 — scope-overlap gate + pre-merge dry-run.** Step A defers any pending task whose `scope.include` matches a tracked file already claimed by a `RUNNING` task — overlap is computed by intersecting the two `git ls-files -- <pathspecs>` results plus a literal-glob equality fallback for globs that match no current files. Deferred tasks stay in `PENDING_POOL` and are retried next iteration when slots free; nothing is marked `blocked`. Step B's merge stages the integration branch via `git merge --no-commit --no-ff --no-edit`, inspects unmerged paths, and either finalizes with `git commit --no-edit` (clean) or `git merge --abort` (conflict) — separating conflict detection from commit creation.
+- **M4 — scope-overlap gate + pre-merge dry-run.** Step A defers any pending task whose `scope.include` matches a tracked file already claimed by a `RUNNING` task — overlap is computed by intersecting the two `git ls-files -- <pathspecs>` results plus a literal-glob equality fallback for globs that match no current files. Deferred tasks stay in `PENDING_POOL` and are retried next iteration when slots free; nothing is marked `blocked`. Step B's merge stages the integration branch via `git merge --squash --no-edit` (pre-M6 §15.1 — originally `git merge --no-commit --no-ff --no-edit`), inspects unmerged paths via `git ls-files -u`, and either finalizes with a supervisor-authored `T-<id>: <title>` commit (clean) or rolls back via `git restore --staged --worktree .` (conflict) — separating conflict detection from commit creation.
 - **M5 — stuck-exit auto-revise + re-dispatch (this milestone).** Worker `chat_close({status: "stuck"})` is now recoverable in bounded cases. The broker records every `chat_close` status in an in-memory ring buffer (`chat_supervisor_recent_closures` MCP tool); Step B queries it after a `no-commit` classification to peel off stuck exits from the broader cap-hit / filtered-clean / aborted bucket. On the first stuck exit per task, the supervisor prompts the human (via `AskUserQuestion`) with the stuck-finding details tailed from the worker log and offers three outcomes — re-dispatch with guidance, re-dispatch unchanged, or abort. Re-dispatch with guidance appends the human's text to the brief's `## Decisions` section, commits the revised brief, cleans the prior worktree+branch, and re-spawns the worker; the BOARD row's `attempts` counter increments. A second stuck exit on the same task classifies as `stuck-exhausted` and blocks without prompting — one re-dispatch is the hard cap. See §P2.5.
 
 Still deferred (out of scope for M5):
@@ -32,6 +32,7 @@ SSOT for all design decisions: `docs/supervisor-design.md`. Read it before editi
 - `--integration BRANCH` — branch merges land on. Default: the supervisor's current branch. Must exist locally.
 - `--max-tasks M` — stop accepting new dispatches after M successful merges. Currently-running workers still complete. Default: unlimited.
 - `--worker-loops N` — value passed to each worker's `/ccx:loop --loops N`. Default: `5`. Clamp `1..20`. Tuning knob — see §14 of the design doc (open question on worker budget). `/ccx:loop` is used instead of `/ccx:forever` so every worker has a natural token cap.
+- `--chat` — pre-M6 §15.3. Register the supervisor session with the `ccx-chat` broker and post lifecycle messages (run start, dispatch, merge, block, stuck prompt, run end) to Discord as fire-and-forget `chat_send` calls. The supervisor never calls `chat_ask` under `--chat` — nothing should queue from the supervisor side; every `AskUserQuestion` stays local. Requires one-time `/ccx:chat-setup`; degrades gracefully if the broker is unreachable (log once, continue without chat). See Phase P0.5.
 - `--dry-run` — parse `BOARD.md`, print the dispatch plan, then exit without writing briefs, committing, or spawning workers.
 
 No free-form task description — the supervisor drives entirely from `BOARD.md`. If positional text is supplied, log a warning and ignore it.
@@ -72,6 +73,40 @@ If anything fails, print the exact error and stop. No partial setup.
 
 ---
 
+## Phase P0.5: Chat bridge setup (only if `--chat` is set)
+
+Pre-M6 §15.3. Registers the supervisor's own ccx-chat session so Discord watchers can see lifecycle events that are otherwise invisible (workers post their own chatter, but from Discord you cannot tell a supervisor run started in repo X, which worker got T-N, or when the run ended).
+
+1. **Tool availability check.** Before calling any `mcp__ccx-chat__*` tool, verify it appears in this session's tool surface (same check §P2 Step B2 performs for `chat_supervisor_poll` and /ccx:loop Phase 0.7 performs for its own chat bridge). If the `ccx-chat` MCP server is not registered — the user has not run `/ccx:chat-setup`, or it failed — `chat_register` is simply absent. Log once to stderr: `--chat requested but ccx-chat MCP server is not available. Run /ccx:chat-setup first. Continuing without chat.` Then unset `--chat` for the rest of the run and proceed. Do NOT abort the supervisor — the user opted into chat, not into blocking on it.
+
+2. **Register the supervisor session.** Call `mcp__ccx-chat__chat_register` with:
+   - `label` — `[supervisor] <repo_basename> — <UTC-YYYY-MM-DD HH:MM>Z`. Truncated to ~80 chars by the broker. The `[supervisor]` prefix disambiguates from worker sessions in `/sessions`-style listings; the repo basename mirrors pre-M6 §15.4's broker message prefix (both short, never the absolute path); the UTC timestamp lets the human scroll back through Discord and correlate a session banner to a specific run.
+   - `cwd` — `REPO_ROOT` (absolute path; the broker uses `basename(cwd)` to render the repo prefix on every message — matching §15.4 exactly).
+   - `branch` — `INTEGRATION` (the supervisor operates on the integration branch by contract — P0 step 2a enforces this).
+3. **Store the returned `sessionId` as `CHAT_SESSION_ID`.** On any error from `chat_register` (broker down, Discord 5xx, misconfig), log the error once, leave `CHAT_SESSION_ID` unset, and continue. Every later `chat_send` call gates on `CHAT_SESSION_ID` being truthy, so a register-time failure cleanly degrades to the no-chat path.
+4. **Set the initial phase** via `chat_set_phase({sessionId: CHAT_SESSION_ID, phase: "dispatching"})` immediately after register. Later phase transitions: `draining` when `STOP_DISPATCHING` is set or `READY` exhausts while `RUNNING` is non-empty; `closing` at the top of P3. Phase-set failures are logged and ignored — phase is a nice-to-have, not load-bearing.
+5. **Degraded-mode handling.** If any later `chat_*` call fails with a non-cancellation error, log the error once, set a run-level `CHAT_DEGRADED = true` flag, and stop attempting further chat calls for the rest of the run to avoid spamming errors. The final P3 report must mention that chat was lost mid-run. Do NOT retry; a broker that dropped one call is unlikely to recover within the same scheduling loop, and retries would just clutter the log.
+6. **Cancellation semantics.** Unlike `/ccx:loop`'s `--chat`, the supervisor never calls `chat_ask`, so the `source: "cancel"` path has no trigger. If any `chat_send` call returns an error whose message contains the substring `cancelled` (e.g. `session ab12 was cancelled (user)`), the user issued `!ccx cancel #<id>` from Discord. STOP the supervisor loop immediately without dispatching new workers (set `STOP_DISPATCHING = true` so Step B continues to drain `RUNNING`), skip to P3, and exit via `chat_close({status: "aborted"})`. Do not interpret generic transient errors (network, timeout) as cancellations — only the literal substring `cancelled`.
+
+**Lifecycle messages** — fire-and-forget via `mcp__ccx-chat__chat_send({sessionId: CHAT_SESSION_ID, text: ...})`. All gated on `CHAT_SESSION_ID && !CHAT_DEGRADED`. The broker automatically prepends the color tag, repo prefix (§15.4), and session-id to every body, so the text below should NOT redundantly include the repo name. Each bullet is a separate `chat_send` call — never pack multiple facts onto one line; one fact per bullet renders better in Discord:
+
+| Event | Where fired | `text` body (multi-line; use `\n` between bullets) |
+|---|---|---|
+| Run start | After P0.5 registration succeeds AND P1's `Proceed` answer returns | `supervisor run started\n• parallel=<N>\n• worker-loops=<N>\n• integration=<branch>\n• pending=<count>\n• ready=<count>\n• deferred-by-deps=<count>` |
+| Dispatch | Step A step 8 (right after the one-line stderr dispatch notice) | `dispatched T-<id> — <title>\n• worker session=<sessionId from chat_register inside the worker, if knowable; else "launching">\n• worktree=<REPO_ROOT>-<id>\n• branch=ccx/<id>\n• attempt=<attempts>` |
+| Merge | Step B step 3's clean-squash-and-commit outcome | `merged T-<id> — <title>\n• commit=<short SHA>\n• squashed via T-<id>: <title>\n• attempts=<N>` |
+| Block | Step B step 3/4's any blocked outcome (per-task, including stuck-exhausted / stuck-aborted) | `blocked T-<id> — <exit_status>\n• notes=<first 120 chars of notes>\n• log=.ccx/workers/T-<id>.log` |
+| Stuck prompt | §P2.5 step 4, just before `AskUserQuestion` opens | `stuck T-<id> — human guidance requested\n• attempt=<N of <STUCK_REDISPATCH_CAP>>\n• log=.ccx/workers/T-<id>.log` — the lead-in message makes the subsequent `AskUserQuestion`-routed prompt on Discord (via supervisor-mode fallback) legible to a watcher who didn't trigger it |
+| Run end | Top of P3, before printing the textual report | `supervisor run complete\n• merged=<N>\n• blocked=<N>\n• stranded=<N>\n• duration=<human-readable>\n• audit=.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl (if written)` |
+
+**Never `chat_ask`.** The supervisor's human gate is always `AskUserQuestion` locally (P1 Proceed, §P2.5 stuck prompt). `chat_ask` from supervisor would queue in the broker and require the supervisor to poll its own queue, which is not the supervisor's role. Stick to fire-and-forget `chat_send`.
+
+7. **Close the session at P3.** Call `chat_close({sessionId: CHAT_SESSION_ID, status: ...})` exactly once, in a `finally`-style block that runs even when earlier phases threw. `status` is one of: `approved` (all dispatched tasks merged), `completed` (mixed merged/blocked, nothing in flight), `stuck` (any `stuck-exhausted`), `aborted` (human issued `!ccx cancel`), `error` (uncaught supervisor error). Pick `completed` as the default for successful runs that did not all merge; reserve `approved` for runs where every dispatched task ended `merged`.
+
+If `--chat` was unset by step 1's tool-availability check, all seven items above are no-ops.
+
+---
+
 ## Phase P1: Parse BOARD.md and plan
 
 1. Read `REPO_ROOT/BOARD.md`. Extract:
@@ -95,6 +130,7 @@ If anything fails, print the exact error and stop. No partial setup.
    - `BLOCKED` / `ASSIGNED` / `REVIEW` — present for visibility; supervisor does not touch these (they need human action or are owned by a prior/concurrent run).
 6. If `--dry-run`, stop here.
 7. Otherwise call `AskUserQuestion`: "Proceed with dispatch plan?" with options **Proceed** / **Abort**. On Abort, stop with no side effects.
+8. On **Proceed**, capture `RUN_STARTED_AT = <UTC ISO 8601>` for P3's run-end duration calculation. Then fire the pre-M6 §15.3 run-start lifecycle message per the table in P0.5 (gated on `CHAT_SESSION_ID && !CHAT_DEGRADED`).
 
 ---
 
@@ -112,6 +148,9 @@ State:
 - `DEFERRED_THIS_PASS = set()` — Step A scratch state, cleared at the top of every Step A pass. Tracks which `READY` task ids have already been popped and deferred this pass due to scope-overlap so the inner loop does not re-pop and re-defer the same task indefinitely (popping is destructive — without this set the head of `READY` would be reconsidered until slots fill, masking lower-priority dispatchable tasks behind it).
 - `EVER_DEFERRED_BY_SCOPE = set()` — run-level accumulator, NEVER cleared. A1's clear of `DEFERRED_THIS_PASS` is correct for slot-fill scheduling but discards the history P3 needs to classify leftover `PENDING_POOL` entries. Every time A2 step 1a defers a task by scope-overlap, also add its id to `EVER_DEFERRED_BY_SCOPE`. P3 reads this set to attach the `scope-deferred` reason to any task that ends the run still in `PENDING_POOL`. A task that was deferred earlier but eventually dispatched (and then merged or blocked) stays in this set, but P3 ignores it because it is no longer in `PENDING_POOL` at exit — the set is purely a tag, not a status.
 - `STOP_DISPATCHING = false` — set to `true` by Step B's merge-commit-failed branch (M4) when the integration-branch commit pipeline rejects a merge commit. While `true`, Step A's slot-fill is skipped entirely so no new workers start, but Step B continues to drain `RUNNING` so already-in-flight peers are not stranded as `assigned`. Loop exit gains a new condition 3 (see below) that fires once `RUNNING` drains, because `READY` may legitimately still hold pending tasks at that point — those tasks are intentionally being left for a future supervisor run after the human resolves the broken commit pipeline.
+- `LAST_OUTPUT_SEEN = {}` — map `shell_id -> byte length of BashOutput buffer at last Step C probe`. Pre-M6 §15.2 — Step C's adaptive polling primitive uses this to detect "a worker produced new output since the last probe" and break out of the 30s wait early. New entries are added by Step A step 7 (initialize to the then-current `BashOutput` length on the first Step C pass after dispatch); entries are removed from `LAST_OUTPUT_SEEN` in Step B step 5 when the task is removed from `RUNNING` so the map cannot grow unbounded across a long run.
+- `CHAT_SESSION_ID` and `CHAT_DEGRADED` — pre-M6 §15.3 — set (or not) by P0.5. `CHAT_SESSION_ID` is truthy only when `--chat` was requested, the MCP tool surface was available, AND `chat_register` succeeded. `CHAT_DEGRADED = true` after the first `chat_*` error; once set, all subsequent `chat_send` calls are skipped. Together they gate every lifecycle message below as `if (CHAT_SESSION_ID && !CHAT_DEGRADED) chat_send(...)`.
+- `RUN_STARTED_AT` — UTC ISO 8601 captured at the top of P1 after the dispatch plan prints. Used by P3's run-end chat message to compute `duration`. Not load-bearing for any non-chat behavior.
 
 **Exit conditions** (evaluated at the top of every iteration, after A1 recomputes `READY`):
 
@@ -189,7 +228,7 @@ A2. **Skip A2 entirely when `STOP_DISPATCHING == true`** — no slot-fill, no ov
    - `git add -- BOARD.md` and `git commit -m "supervisor: dispatch <TASK.id> <TASK.title>"`.
    - If this commit fails, the worker is already running — log the error, leave the worker alone (it will eventually finish and be picked up by Step B), and STOP the whole run. Do NOT kill the worker; its log and branch are preserved for manual recovery.
 7. Write `RUNNING[TASK.id] = { shell_id: SHELL_ID, worktree_path: "<REPO_ROOT>-<TASK.id>", branch: "ccx/<TASK.id>", log_path: ".ccx/workers/<TASK.id>.log", started_at: STARTED_AT, scope_include: TASK.scope.include, attempts: 1 }` (reuse the SAME `STARTED_AT` captured in step 4) AND add `TASK.id` to the `DISPATCHED` set. The `scope_include` field is a verbatim copy of the BOARD row's glob list captured at dispatch time — Step A's overlap gate (§P2.4) reads it on every subsequent pass, so it MUST snapshot the value rather than re-read BOARD (a concurrent BOARD edit between dispatch and the next pass would otherwise change the overlap picture under the supervisor). The `attempts` field mirrors the BOARD row's `attempts: 1` just written in step 6; §P2.5 increments both in lockstep on re-dispatch. `DISPATCHED` is never removed from — it's the ownership source of truth for Step B2's filter across the whole run. Remove `<TASK.id>` from `PENDING_POOL`.
-8. Print a one-line dispatch notice: `dispatched <TASK.id> (<TASK.title>) → shell <SHELL_ID>, log <log_path>`.
+8. Print a one-line dispatch notice: `dispatched <TASK.id> (<TASK.title>) → shell <SHELL_ID>, log <log_path>`. Pre-M6 §15.3 — also fire the dispatch lifecycle `chat_send` per the table in P0.5 (gated on `CHAT_SESSION_ID && !CHAT_DEGRADED`). The worker's own chat session id is not yet known at this point — its `/ccx:loop --chat` register call fires later inside the spawned process — so the message uses `launching` as a placeholder. A Discord watcher correlates the worker to this supervisor dispatch by matching `T-<id>` across both messages.
 
 ### Step B — Drain completions
 
@@ -207,54 +246,134 @@ For each `(task_id, meta)` in `RUNNING`:
    - **no-commit** — exit code 0 but no new commits. Worker exited via filtered-unapproved, stuck, cap-hit, or user cancellation — `/ccx:loop`'s Phase 4 auto-commit gate correctly blocked the commit. Mark `blocked`.
    - **error** — non-zero exit code (crash, invalid args, missing `claude -p`). Mark `blocked`.
 
-3. For **approved**, attempt a **two-step pre-merge dry-run** onto the integration branch — stage the merge with `--no-commit`, inspect the index, then either finalize or abort. Splitting "test the merge" from "commit the merge" lets the supervisor reason about conflicts as a first-class outcome (and gives M5 a hook to run extra validation between stages without rewriting the merge call):
+3. For **approved**, attempt a **two-step pre-merge dry-run** onto the integration branch using `git merge --squash`. The dry-run stages the merge result into the index + worktree without creating any commit; the supervisor then inspects unmerged paths, asserts the rest of the working tree was clean before the squash, and either finalizes with one supervisor-authored commit (subject `T-<id>: <title>`) or rolls back via `git restore --staged --worktree .`. Squash is preferred over `--no-ff`: `/ccx:loop` Phase 4 squashes its review-fix cycles into a single final commit, so a worker branch is exactly one commit anyway, and a `--no-ff` merge commit would just add a tree-empty graph node. Squash gives the same audit surface (one commit per task on integration, identifiable by its `T-<id>:` subject) without the extra commit:
 
    ```bash
-   if git merge --no-commit --no-ff --no-edit "ccx/<task_id>"; then
-     # Dry-run reports clean — finalize using the prepared MERGE_MSG.
-     git commit --no-edit
+   # Pre-merge cleanliness assert. The rollback path (`git restore --staged
+   # --worktree .`) wipes uncommitted changes wholesale. P0 step 3 already
+   # gates on a clean tree at supervisor entry, but a prior Step B iteration
+   # could in principle leave artifacts; re-asserting here is load-bearing —
+   # if the tree is dirty we MUST refuse this merge entirely (skipping every
+   # downstream `git merge --squash` / `git restore` call), classify the task
+   # as merge-aborted, and continue with the next RUNNING task. Falling
+   # through to `git merge --squash` on a dirty tree means the rollback path
+   # would `git restore --staged --worktree .` over the user's unrelated
+   # uncommitted edits and silently destroy them.
+   PRE_MERGE_DIRTY="$(git status --porcelain)"
+   if [ -n "$PRE_MERGE_DIRTY" ]; then
+     # Skip the whole squash/commit/rollback block below. Append <task_id> to
+     # BLOCKED_IDS, stash BOARD-row update: status: "blocked", exit_status:
+     # "merge-aborted", notes: "integration tree dirty before squash —
+     # refused to attempt merge (would risk clobbering: <first 200 chars of
+     # PRE_MERGE_DIRTY, single-line>)". Do NOT set STOP_DISPATCHING — this
+     # is per-merge, not per-supervisor; if every subsequent peer also hits
+     # a dirty tree, the recurring pattern surfaces in P3. Then `continue`
+     # the outer Step B drain loop. The supervisor MUST NOT execute any of
+     # the merge / rollback commands below in this iteration.
+     :
+   fi
+
+   if git merge --squash --no-edit "ccx/<task_id>"; then
+     # Squash succeeded — index + worktree now hold the merged result with
+     # NO MERGE_HEAD set (squash never sets MERGE_HEAD). Inspect unmerged
+     # paths via `git ls-files -u`; squash skips files with conflicts but
+     # surfaces them in the unmerged-paths list rather than aborting.
+     UNMERGED="$(git ls-files -u)"
+     if [ -z "$UNMERGED" ]; then
+       # Clean squash. Finalize as one supervisor-authored commit whose
+       # body preserves every worker commit's full message (subject + body),
+       # so the M3 Tier-3 worker-history lookup (§P2.3) keeps its citation
+       # surface even after squash collapsed the per-cycle commits. Without
+       # this, the integration branch would only carry the supervisor's
+       # `T-<id>: <title>` subject line and Tier-3 would have nothing to
+       # match. `--no-merges` excludes any older `--no-ff` history that
+       # might be reachable; `<INTEGRATION>..ccx/<task_id>` scopes to the
+       # worker's own commits ahead of integration, in chronological order.
+       WORKER_LOG="$(git log --no-merges --reverse --format='--- %h %s%n%b' "<INTEGRATION>..ccx/<task_id>")"
+       git commit -m "T-<task_id>: <task_title>" -m "Worker commits squashed into this merge:" -m "$WORKER_LOG"
+     else
+       # Conflict: capture file list and roll back the staged squash.
+       CONFLICT_FILES="$(git ls-files -u | awk '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')"
+       git restore --staged --worktree .
+     fi
    else
-     # Non-zero from --no-commit. Two sub-cases:
-     #   - conflict (unmerged paths present)
-     #   - non-conflict failure (refusal, branch-protection, no-merge-already-in-progress)
-     # Capture unmerged paths BEFORE the abort wipes the index, then abort
-     # (ignoring the abort's exit code — `git merge --abort` errors when no
-     # merge is actually in progress, which is correct for the non-conflict case).
-     CONFLICT_FILES="$(git diff --name-only --diff-filter=U)"
-     git merge --abort 2>/dev/null || true
+     # Non-zero from --squash. Two sub-cases share this branch and must be
+     # distinguished BEFORE the rollback wipes the unmerged index:
+     #   (a) a normal content conflict — squash leaves stage-2/3 entries in
+     #       the index AND exits non-zero; this is the common case and must
+     #       be classified as `merge-conflict`, not `merge-aborted`.
+     #   (b) a true refusal (pre-merge hook rejection, branch protection
+     #       blocking the staged write, unreachable object) — no unmerged
+     #       paths, exit non-zero; this is `merge-aborted`.
+     # Inspect `git ls-files -u` first; only wipe afterwards. The rollback
+     # is idempotent regardless of which sub-case we hit.
+     UNMERGED="$(git ls-files -u)"
+     if [ -n "$UNMERGED" ]; then
+       CONFLICT_FILES="$(echo "$UNMERGED" | awk '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')"
+     else
+       CONFLICT_FILES=""
+     fi
+     git restore --staged --worktree .
+     # Caller branches on CONFLICT_FILES: non-empty → "Conflict" outcome;
+     # empty → "Non-conflict squash refusal" outcome (single in-iteration
+     # retry, then merge-aborted if it persists).
    fi
    ```
 
-   Four outcomes (the third and fourth are M4 additions; the first two preserve the M3 behavior):
+   Squash semantics relevant to the algorithm above:
+   - `git merge --squash` does NOT set `MERGE_HEAD` and does NOT create a commit. There is no `git merge --abort` equivalent because no merge state exists; rollback is `git restore --staged --worktree .`, which reverts the index AND the worktree to `HEAD`. The pre-merge cleanliness assert is what makes that safe — we know there are no other uncommitted changes to lose.
+   - File-level conflicts during squash leave the index in a stage-2/3 state (the same `git ls-files -u` surface as a regular merge conflict). The squash exit code is non-zero but the worktree has the conflict markers written; restore wipes both.
+   - `git restore --staged --worktree .` is the recommended rollback (preserves branch ref semantics; never moves `HEAD`); `git reset --hard` is rejected because it is more aggressive than needed and would also discard reflog-recoverable state that human triage might want.
 
-   - **Clean dry-run + commit succeeds** (`git merge --no-commit ...` exit 0 AND `git commit --no-edit` exit 0 AND `HEAD` moved): `MERGED_COUNT += 1`, append `task_id` to `MERGED_IDS`, stash a BOARD-row update in memory: `status: "merged"`, `finished_at: "<now>"`, `exit_status: "approved"`. Do NOT commit BOARD yet — step D batches all BOARD updates into one commit.
-   - **Conflict** (`git merge --no-commit ...` exit non-zero AND `CONFLICT_FILES` non-empty): capture `CONFLICT_FILES` **before** running `git merge --abort` — once the abort runs, the unmerged index is gone and `git diff --name-only --diff-filter=U` returns empty. Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-conflict"`, `notes: "conflict on <CONFLICT_FILES, comma-separated>"`. The worker branch stays intact — the human resolves manually.
-   - **Non-conflict merge refusal** (`git merge --no-commit ...` exit non-zero AND `CONFLICT_FILES` is empty): Git refused the merge for a reason other than file-level conflicts — examples include a `pre-merge-commit` hook rejecting the merge before any tree was written, a branch protection / signed-merge requirement that fails up front, an existing residual `MERGE_HEAD` from a prior failed iteration that Git refuses to overlay, or an unreachable / corrupt object on the worker branch. Some of these are **transient** (residual `MERGE_HEAD` cleared by the abort, `.git/index.lock` released by an exiting peer process, a temporary network blip while resolving the worker branch); others are **permanent** for this run (signed-merge requirement, branch-protection rule, hook that inspects merge content). The supervisor cannot reliably classify these from stderr alone, so it does **one in-iteration retry** before declaring the task permanently blocked.
+   Four outcomes (numbered for clarity; the squash version of M4's conflict-detection-before-commit-creation contract):
 
-     Capture the verbatim stderr from the failed `git merge --no-commit` call (call it `MERGE_STDERR_1`) before running the abort — the abort's own output overwrites Git's diagnostic if both are written to the same buffer. The unconditional `git merge --abort 2>/dev/null || true` above already cleared any residual `MERGE_HEAD`. Then attempt the merge ONCE more, immediately, in the same Step B iteration:
+   - **Clean squash + commit succeeds** (`git merge --squash` exit 0 AND `git ls-files -u` empty AND `git commit` exit 0 AND `HEAD` moved): `MERGED_COUNT += 1`, append `task_id` to `MERGED_IDS`, stash a BOARD-row update in memory: `status: "merged"`, `finished_at: "<now>"`, `exit_status: "approved"`. Do NOT commit BOARD yet — step D batches all BOARD updates into one commit. The commit subject `T-<task_id>: <task_title>` keeps task identity in the first line of the integration history (replacing what `--no-ff`'s implicit `Merge branch ccx/T-<id>` subject used to provide).
+   - **Conflict** (`git ls-files -u` non-empty before the rollback, regardless of whether `git merge --squash` exited 0 or non-zero — both shapes occur in practice: squash exits 0 with stage-2/3 entries when only some paths conflict, and exits non-zero when the conflict prevents finishing). Capture `CONFLICT_FILES` **before** running `git restore` — once restore runs, the unmerged index is gone and `git ls-files -u` returns empty. Use `awk '{print $4}'` (the path column from `ls-files -u`'s stage output) and `sort -u` because conflicted paths appear up to three times (one per stage). Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-conflict"`, `notes: "conflict on <CONFLICT_FILES, comma-separated>"`. The worker branch stays intact — the human resolves manually.
+   - **Non-conflict squash refusal** (`git merge --squash` exit non-zero AND `git ls-files -u` empty before the rollback — i.e. `CONFLICT_FILES` came back empty in the else branch above): Git refused the squash for a reason other than file-level conflicts — examples include a `pre-merge-commit` hook rejecting the staged-but-uncommitted state, a branch protection / signed-merge requirement that fails up front, or an unreachable / corrupt object on the worker branch. Some of these are **transient** (`.git/index.lock` released by an exiting peer process, a temporary network blip while resolving the worker branch); others are **permanent** for this run (signed-merge requirement, branch-protection rule, hook that inspects merge content). The supervisor cannot reliably classify these from stderr alone, so it does **one in-iteration retry** before declaring the task permanently blocked.
+
+     Capture the verbatim stderr from the failed `git merge --squash` call (call it `MERGE_STDERR_1`) before running the rollback. The unconditional `git restore --staged --worktree .` above already cleared any partial squash state. Then attempt the merge ONCE more, immediately, in the same Step B iteration:
 
      ```bash
-     # Single in-iteration retry. Any locks/MERGE_HEAD that the first
-     # abort cleared will not block the retry; permanent rejections will
-     # surface again identically.
-     if git merge --no-commit --no-ff --no-edit "ccx/<task_id>"; then
-       git commit --no-edit
-       # Falls into the "Clean dry-run + commit succeeds" outcome.
+     # Single in-iteration retry. Any locks that the first restore cleared
+     # will not block the retry; permanent rejections will surface again.
+     # Both branches inspect `git ls-files -u` BEFORE the rollback so a
+     # non-zero exit caused by a content conflict (the common shape) is
+     # still classified as merge-conflict, not merge-aborted.
+     if git merge --squash --no-edit "ccx/<task_id>"; then
+       UNMERGED_2="$(git ls-files -u)"
+       if [ -z "$UNMERGED_2" ]; then
+         # Same worker-log preservation as the first-attempt clean path
+         # above so M3 Tier-3 history scans still hit a worker rationale
+         # even when the merge took the retry branch.
+         WORKER_LOG="$(git log --no-merges --reverse --format='--- %h %s%n%b' "<INTEGRATION>..ccx/<task_id>")"
+         git commit -m "T-<task_id>: <task_title>" -m "Worker commits squashed into this merge:" -m "$WORKER_LOG"
+         # Falls into the "Clean squash + commit succeeds" outcome.
+       else
+         CONFLICT_FILES_2="$(echo "$UNMERGED_2" | awk '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')"
+         git restore --staged --worktree .
+         # Falls into the "Conflict" outcome with CONFLICT_FILES_2.
+       fi
      else
-       CONFLICT_FILES_2="$(git diff --name-only --diff-filter=U)"
-       MERGE_STDERR_2="<verbatim stderr of the retry's --no-commit call>"
-       git merge --abort 2>/dev/null || true
-       # Inspect CONFLICT_FILES_2 to decide which permanent branch to take.
+       MERGE_STDERR_2="<verbatim stderr of the retry's --squash call>"
+       UNMERGED_2="$(git ls-files -u)"
+       if [ -n "$UNMERGED_2" ]; then
+         CONFLICT_FILES_2="$(echo "$UNMERGED_2" | awk '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')"
+       else
+         CONFLICT_FILES_2=""
+       fi
+       git restore --staged --worktree .
+       # CONFLICT_FILES_2 non-empty → "Retry conflicts" outcome below.
+       # CONFLICT_FILES_2 empty     → "Retry refuses again" → merge-aborted.
      fi
      ```
 
      Three terminal states from the retry:
-     1. **Retry succeeds** (clean merge + commit): treat exactly like the "Clean dry-run + commit succeeds" outcome above (`MERGED_COUNT += 1`, append to `MERGED_IDS`, stash `status: "merged" / exit_status: "approved"`). Do NOT add a `notes` entry mentioning the first-attempt failure — the merge is in the integration history at this point; a "we retried" note is reflog territory, not BOARD-row territory.
-     2. **Retry conflicts** (`CONFLICT_FILES_2` non-empty): the first attempt's transient cause cleared, exposing a real file-level conflict. Treat exactly like the "Conflict" outcome above (`status: "blocked" / exit_status: "merge-conflict" / notes: "conflict on <CONFLICT_FILES_2, comma-separated>"`).
-     3. **Retry refuses again** (`CONFLICT_FILES_2` empty AND non-zero exit): the rejection is permanent for this run. Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-aborted"`, `notes: "git merge --no-commit refused without conflicts (retried once): <first 200 chars of MERGE_STDERR_2, single-line>"`. Do NOT set `STOP_DISPATCHING` here — `merge-aborted` is per-merge, not per-supervisor; if a subsequent peer's merge also hits the same refusal, the same handler fires again and the human sees a pattern in P3. The worker branch stays intact for manual investigation.
+     1. **Retry succeeds** (clean squash + commit): treat exactly like the "Clean squash + commit succeeds" outcome above (`MERGED_COUNT += 1`, append to `MERGED_IDS`, stash `status: "merged" / exit_status: "approved"`). Do NOT add a `notes` entry mentioning the first-attempt failure — the merge is in the integration history at this point; a "we retried" note is reflog territory, not BOARD-row territory.
+     2. **Retry conflicts** (`UNMERGED_2` non-empty): the first attempt's transient cause cleared, exposing a real file-level conflict. Treat exactly like the "Conflict" outcome above (`status: "blocked" / exit_status: "merge-conflict" / notes: "conflict on <CONFLICT_FILES_2, comma-separated>"`).
+     3. **Retry refuses again** (squash exit non-zero AND `git ls-files -u` empty after rollback): the rejection is permanent for this run. Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-aborted"`, `notes: "git merge --squash refused without conflicts (retried once): <first 200 chars of MERGE_STDERR_2, single-line>"`. Do NOT set `STOP_DISPATCHING` here — `merge-aborted` is per-merge, not per-supervisor; if a subsequent peer's merge also hits the same refusal, the same handler fires again and the human sees a pattern in P3. The worker branch stays intact for manual investigation.
 
-     Why a single in-iteration retry rather than re-queuing for the next Step B iteration: re-queuing would require a new "approved-but-not-yet-merged" state alongside `RUNNING` and `BLOCKED_IDS`, which complicates exit-condition reasoning and could mask a permanent failure as "the supervisor will get to it eventually". A single immediate retry catches the specific transient causes documented above (locks released within milliseconds, `MERGE_HEAD` cleared by the abort) without inventing a new state. Failures that need more than seconds to clear are correctly classified as `merge-aborted` and surfaced for human triage.
-   - **Dry-run clean but commit fails** (pre-commit hook rejects the merge, signing failure, etc.): the working tree still has `MERGE_HEAD` set and the index holds a successful merge result that was never committed. Run `git merge --abort` to restore the integration branch to its pre-merge state — leaving `MERGE_HEAD` around would make the next iteration's `git merge --no-commit` refuse with "You have not concluded your merge". Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-commit-failed"`, `notes: "merge dry-run clean but commit failed — see supervisor stderr"`. Then handle the **likely Step D commit failure** synchronously, before STOPping the run:
+     Why a single in-iteration retry rather than re-queuing for the next Step B iteration: re-queuing would require a new "approved-but-not-yet-merged" state alongside `RUNNING` and `BLOCKED_IDS`, which complicates exit-condition reasoning and could mask a permanent failure as "the supervisor will get to it eventually". A single immediate retry catches the specific transient causes documented above (locks released within milliseconds) without inventing a new state. Failures that need more than seconds to clear are correctly classified as `merge-aborted` and surfaced for human triage.
+   - **Clean squash but commit fails** (pre-commit hook rejects the merge, signing failure, etc.): the index + worktree still hold a successful squash result that was never committed. Run `git restore --staged --worktree .` to wipe both back to `HEAD` — leaving the staged squash around would make the next iteration's `git merge --squash` refuse to overlay onto a dirty tree (and the cleanliness assert would refuse first). Append `task_id` to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `exit_status: "merge-commit-failed"`, `notes: "merge squash clean but commit failed — see supervisor stderr"`. Then handle the **likely Step D commit failure** synchronously, before STOPping the run:
 
      The same condition that rejected the merge commit (broken pre-commit hook, signing key absent, integration-branch protection, etc.) is overwhelmingly likely to reject the Step D batch BOARD commit too. If Step D fails after the merge-commit-failed branch fires, the in-memory `status: "blocked"` update is lost from the repo — `BOARD.md` stays at `status: "assigned"`, and every future supervisor run skips this task (P1 step 3 excludes `assigned` from `PENDING_POOL`). To avoid stranding the row:
 
@@ -298,7 +417,7 @@ For each `(task_id, meta)` in `RUNNING`:
 
      5. **Final P3 report** prints the absolute sidecar path when the file still exists at exit, plus a one-line summary of how many tasks blocked with `merge-commit-failed`. Omit the sidecar-path line entirely when Step D succeeded and the sidecar was deleted in step 4 above.
 
-   The dry-run does NOT replace the abort-on-conflict guarantee — the conflict-capture order in §3 step 3 below is unchanged. The dry-run adds a bounded "clean merge prepared but not yet committed" window; that window MUST be closed by either `git commit --no-edit` or `git merge --abort` before Step B moves to the next `(task_id, meta)`. Never leave a partial merge state across loop iterations — Step B's own next iteration would observe the residual `MERGE_HEAD` and either fail to start a new merge or compound the unfinalized one.
+   The dry-run does NOT replace the abort-on-conflict guarantee — `CONFLICT_FILES` MUST be captured before any rollback. The squash dry-run leaves a bounded "clean merge staged but not yet committed" window; that window MUST be closed by either `git commit -m "T-<task_id>: <task_title>"` (the only intentional persistence path) or `git restore --staged --worktree .` (the rollback) before Step B moves to the next `(task_id, meta)`. Never leave a partial squash state across loop iterations — Step B's own next iteration would observe a dirty integration tree, fail the cleanliness assert, and either refuse the next merge or compound the unfinalized one.
 
 4. For **no-commit**: check whether this was a stuck-finding exit before marking blocked.
 
@@ -342,8 +461,8 @@ For each `(task_id, meta)` in `RUNNING`:
 
    **For error:** append to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "error"`, `notes: "see .ccx/workers/<task_id>.log"`. The M5 stuck sub-classifier is NOT consulted for `error` outcomes — a non-zero shell exit means the worker crashed before it could call `chat_close`, so the closure ring buffer has no entry to examine and re-dispatch would almost certainly hit the same crash again.
 
-5. Remove `task_id` from `RUNNING`.
-6. Print a one-line completion notice summarizing outcome + duration + log path.
+5. Remove `task_id` from `RUNNING`. Also `delete LAST_OUTPUT_SEEN[meta.shell_id]` so the Step C probe map cannot grow unbounded across a long-running supervisor session (pre-M6 §15.2).
+6. Print a one-line completion notice summarizing outcome + duration + log path. Pre-M6 §15.3 — if the task just transitioned to `merged` fire the merge lifecycle `chat_send`; if it transitioned to `blocked` (any `exit_status` including `stuck-exhausted`, `stuck-aborted`, `stuck-recovery-failed`, `stuck-cleanup-failed`, `merge-conflict`, `merge-aborted`, `merge-commit-failed`, `no-commit`, `error`, `stale-artifact`, `spawn-error`) fire the block lifecycle `chat_send`. Both gated on `CHAT_SESSION_ID && !CHAT_DEGRADED` per the table in P0.5. Never emit both for the same task-completion event.
 
 ### Step B2 — Answer supervisor asks
 
@@ -381,7 +500,7 @@ Before the first iteration of the scheduling loop runs Step B2, initialize two i
 
       1. **Brief `## Decisions` table** — `Read` `REPO_ROOT/.ccx/tasks/<TASK_ID>.md` (the committed supervisor-owned copy at `REPO_ROOT`, NOT the worktree copy — the worktree copy could have been edited by the worker even though the dispatch prompt forbids it; reading the integration-branch copy keeps supervisor decisions traceable to dispatch-time content). Parse the `## Decisions` section as a YAML-ish list of `- q: "…"` / `  a: "…"` pairs. Match the ask's `prompt` against each `q` semantically — paraphrase is fine, topic drift is not.
       2. **BOARD `## Direction`** — `DIRECTION_TEXT` captured in P1. Match for project-wide policy statements that directly answer the ask (e.g. "prefer stdlib over third-party deps" answers "can I add lodash?").
-      3. **Integration-branch worker-commit history** — `git log "<INTEGRATION>" -n 40 --no-merges --format='%H%x09%s%x09%b'`. Scan each commit's subject + body for lexical hits on the ask's prompt. `--no-merges` is important: Step B creates merge commits with `git merge --no-ff --no-edit`, which produces a `Merge branch 'ccx/T-<id>'` subject and an **empty body**, so the worker rationale we want lives on the worker's own commits (still reachable from the integration branch after `--no-ff`). Worker commit subjects typically describe the change and — via `/ccx:loop`'s Phase 4 — often carry a rationale paragraph. Include the worker commit SHA (first 8 chars) in the reply citation, not the merge SHA.
+      3. **Integration-branch worker-commit history** — `git log "<INTEGRATION>" -n 40 --format='%H%x09%s%x09%b'`. Scan each commit's subject + body for lexical hits on the ask's prompt. Pre-M6 §15.1 switched Step B to `git merge --squash`, so integration history now contains one supervisor-authored commit per task (subject `T-<id>: <title>`) whose body preserves every squashed worker commit's full message (subject + body, in chronological order — see Step B step 3's `WORKER_LOG` interpolation). `--no-merges` is no longer needed (squash produces no merge commits at all) and the worker rationale that Tier 3 needs to cite is present in the squash commit body. Cite the squash commit SHA (first 8 chars) in the reply; the body line that hit can be quoted verbatim. Older history written before §15.1 may still contain `--no-ff` merge commits (empty body, `Merge branch 'ccx/T-<id>'` subject); those are harmless to scan because they will never lexically match a specific ask.
 
    b. **Decide.**
       - **Confident match** (see §P2.3) → call `mcp__ccx-chat__chat_supervisor_reply` with `{askId, reply}`. The reply MUST begin with a one-line source citation — `"From brief Decisions: "`, `"From BOARD direction: "`, or `"From worker-commit <first 8 chars of SHA>: "` — so the worker can push back if the match was wrong.
@@ -396,12 +515,26 @@ Before the first iteration of the scheduling loop runs Step B2, initialize two i
 
       Concrete implementation sketch: build the line with `node -e 'process.stdout.write(JSON.stringify({ts:…, prompt:…, …})+"\n")' >> .ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` or write a small inline `jq -n` expression — either produces valid JSON regardless of input. If the broker call returned `{ok: false}` (ask already resolved by auto-escalate timer or session cancel), still write the audit line with `brokerOk: false` so the trail is complete. Create the log file the first time it is needed; the `.ccx/` directory was created in P0. Never truncate the file; never use `echo "…"` heredoc interpolation for JSON payloads — it cannot safely encode untrusted strings.
 
-### Step C — Sleep and repeat
+### Step C — Adaptive wait
 
-Sleep 3 seconds (`sleep 3`). Go back to the top of the iteration — **re-evaluate all three exit conditions first** (after A1 recomputes `READY`), then run Steps A → B → B2 in order if none of the three conditions fires. A1 is where newly-unblocked dependents get picked up by a fresh merge; B2 is where supervisor-mode runs drain worker `chat_ask` queues (Discord-only runs skip B2). This iteration shape guarantees the loop cannot spin in any of the documented failure modes:
+Wait until either (a) at least one worker in `RUNNING` produces new `BashOutput` lines, or (b) 30 seconds have elapsed since entering Step C, whichever happens first. Then go back to the top of the iteration — **re-evaluate all three exit conditions first** (after A1 recomputes `READY`), then run Steps A → B → B2 in order if none of the three conditions fires. A1 is where newly-unblocked dependents get picked up by a fresh merge; B2 is where supervisor-mode runs drain worker `chat_ask` queues (Discord-only runs skip B2). This iteration shape guarantees the loop cannot spin in any of the documented failure modes:
 - (a) all remaining pending tasks depend on `blocked` predecessors → condition 1 fires once `RUNNING` drains.
 - (b) `--max-tasks` has been reached with tasks still pending → condition 2 fires once `RUNNING` drains.
 - (c) `STOP_DISPATCHING` was set by Step B's merge-commit-failed branch (M4) and `PENDING_POOL` still holds untouched tasks → condition 3 fires once `RUNNING` drains. Without checking condition 3 here, A1 keeps `READY` populated from `PENDING_POOL` and the loop would spin forever in this exact failure mode the M4 path is meant to handle.
+
+**Why adaptive polling, not a fixed sleep.** Pre-M6 §15.2 replaced an earlier fixed `sleep 3` with this primitive because (a) Claude Code 2.1.x blocks long standalone leading sleeps, and during e2e the supervisor-LLM sometimes deviated from `sleep 3` and emitted `sleep 30` / `sleep 60` instead, hanging the whole scheduling loop; (b) a fixed 3s cadence wakes the loop 20× per minute even when no worker has produced output, which is wasted LLM budget in the long runtime. The adaptive primitive below is robust to both: any overshoot is naturally capped at 30s, and quiet iterations still cost essentially zero because the supervisor is blocked on `BashOutput` probes rather than re-running Steps A/B/B2.
+
+**Algorithm.** Maintain a per-`shell_id` counter `LAST_OUTPUT_SEEN[shell_id]` across iterations; it is the byte length (or line count — whichever `BashOutput` exposes, use byte length by default) of the worker log the last time Step C inspected it. Initialize new entries to the current `BashOutput` length on the first Step C pass after a dispatch in Step A. On every Step C entry:
+
+1. Record `STEP_C_ENTERED_AT = $(date +%s)` (UTC monotonic wall clock via `date` is adequate — precision within ±1s is fine; the 30s cap is a budget, not a deadline).
+2. Inner loop (repeat until a break condition fires):
+   a. For each `(task_id, meta)` in `RUNNING`, call `BashOutput` on `meta.shell_id`. If its current output length exceeds `LAST_OUTPUT_SEEN[meta.shell_id]`, update `LAST_OUTPUT_SEEN` to the new length and **break out of Step C immediately** — a worker just produced output and Step B is more likely to find a classifiable completion on the next pass than it was 3 seconds ago.
+   b. If `($(date +%s) - STEP_C_ENTERED_AT) >= 30`, break out of Step C — the 30s cap prevents Step C from blocking indefinitely in the (unlikely but possible) case that every `RUNNING` worker is silent for the whole window but also has not exited. Even without new output, Step B might still classify a completion (e.g. a worker exits silently), so revisiting the top of the iteration is the right move.
+   c. **Sleep exactly 2 seconds** (`sleep 2`, not 3, not 5, not 30 — the short sleep is mandatory because Claude Code 2.1.x blocks long standalone leading sleeps and because 2s is small enough that the 30s cap is reached in a predictable 15 iterations). Then loop back to step 2a.
+3. When `RUNNING == {}`, skip the inner loop entirely — there is no worker to watch. In that case Step C reduces to a single `sleep 2` so the loop still yields cooperatively to the OS scheduler, after which the top-of-iteration exit conditions fire (condition 1 or 3, depending on state).
+4. When `SKIP_B2 == false` AND the broker is reachable AND `asks` were pending on the most recent Step B2 poll, prefer a shorter inner-loop cap — break the inner loop after 10 seconds instead of 30. Rationale: a pending ask is work the supervisor owes the worker; the 2s `sleep 2` step gives the broker a chance to return additional asks between polls, but sitting on a 30s cap while workers are waiting on the supervisor for a reply stalls every dispatched worker. This is the only branch that deviates from the 30s ceiling.
+
+**Implementation.** Because Step C runs inside the LLM-driven scheduling loop, each iteration of 2a uses `BashOutput` tool calls (one per `RUNNING` entry), and step 2c uses a `Bash` call with literally `sleep 2` — never a joined sleep like `sleep 30 && ...`. Never issue `sleep` with any value other than `2`. Never issue `sleep` from a wrapper that resolves its own duration from a variable (e.g. `sleep $POLL_INTERVAL`); the harness-level sleep-guard inspects the literal argument, and a variable-resolved duration that happens to be large would still block. Do NOT attempt to replace the inner loop with a single blocking `until` one-liner in shell: that would (a) produce a long-running Bash call the LLM cannot inspect for worker output between probes, and (b) lose the per-iteration `BashOutput` checkpointing that `LAST_OUTPUT_SEEN` needs to avoid over-counting stale output across iterations.
 
 ### Step D — Batch BOARD.md commit
 
@@ -553,7 +686,7 @@ A "confident match" is one where the supervisor is willing to answer a worker's 
 
 - **Tier 1 — Brief `## Decisions` entry (CONFIDENT).** Reply if the ask asks substantively the same question as a `- q:` entry in the brief's Decisions section. Paraphrase is fine ("which of X vs Y?" matches `q: "X vs Y?"`). Do NOT stretch across topics: an ask about library X does not match a decision about library Z just because both are "library choice" questions.
 - **Tier 2 — BOARD `## Direction` direct policy hit (CONFIDENT).** Reply if `DIRECTION_TEXT` contains a policy statement that concretely answers the ask. "Prefer stdlib over third-party deps" answers "can I add `lodash`?" with "no, use stdlib". Do NOT fabricate policy from vague direction — "focus on reliability" is not a concrete answer.
-- **Tier 3 — Prior worker commits on the integration branch (LESS CONFIDENT).** Reply only if a recent worker commit's subject + body (via `git log --no-merges`, so merge commits are excluded since `--no-ff --no-edit` leaves them empty-bodied) contains a decision that clearly governs the ask. Include the worker commit SHA (first 8 chars) in the reply. SKIP this tier when the ask is safety-sensitive (touching auth, data migrations, destructive operations, secret handling, network/filesystem permissions) — those always escalate.
+- **Tier 3 — Prior task commits on the integration branch (LESS CONFIDENT).** Reply only if a recent commit's subject + body contains a decision that clearly governs the ask. Since pre-M6 §15.1 switched Step B to `git merge --squash`, integration commits from the supervisor take the shape `T-<id>: <title>` with the full chronological worker-commit log preserved in the body (Step B step 3's `WORKER_LOG`). Cite the commit SHA (first 8 chars) and quote the body line that hit. Older `--no-ff` merge commits from pre-§15.1 runs are empty-bodied and will never lexically match — they are harmless to scan. SKIP this tier when the ask is safety-sensitive (touching auth, data migrations, destructive operations, secret handling, network/filesystem permissions) — those always escalate.
 - **Everything else → ESCALATE.** Ambiguous match, multiple conflicting sources, safety-sensitive, no source hit at all. Escalation is the default; autonomous answering is an optimization over always-escalating, not a replacement for human judgement.
 
 **Auto-escalate race.** The broker's auto-escalate timer is the hard deadline, but the broker applies a **per-ask clamp**: `SupervisorAdapter.enqueue()` in `plugins/ccx/mcp/ccx-chat/adapters/supervisor.mjs` sets the real delay to `min(AUTO_ESCALATE_AFTER_SEC, max(1, floor(timeoutSec) - 2))` when the worker supplied a finite positive `timeoutSec`, and `AUTO_ESCALATE_AFTER_SEC` otherwise. For each polled ask, compute the per-ask deadline the same way using the `timeoutSec` field returned by `chat_supervisor_poll`:
@@ -655,7 +788,7 @@ Every step below runs synchronously inside Step B's per-task drain loop — the 
 
 3. **Also read the brief's current `## Decisions` section** from `REPO_ROOT/.ccx/tasks/<task_id>.md`. Include the section body (max first 1500 chars) in the prompt so the human sees what was already seeded before adding another entry.
 
-4. **Ask the human** via a single `AskUserQuestion`. `AskUserQuestion` always exposes an "Other" free-text response alongside the labeled options, so the supervisor encodes the three logical outcomes (unchanged re-dispatch, abort, guidance-based re-dispatch) as two labeled options plus the "Other" free-text path. That avoids a two-step flow where a second question only exists to collect free text.
+4. **Ask the human** via a single `AskUserQuestion`. Pre-M6 §15.3 — just before opening the question, fire the stuck-prompt lifecycle `chat_send` per the P0.5 table (gated on `CHAT_SESSION_ID && !CHAT_DEGRADED`). The lead-in Discord message makes the subsequent AskUserQuestion prompt (which already routes to Discord via supervisor-mode fallback when the user is not at the terminal) obviously the supervisor's trigger rather than a stray worker ask. `AskUserQuestion` always exposes an "Other" free-text response alongside the labeled options, so the supervisor encodes the three logical outcomes (unchanged re-dispatch, abort, guidance-based re-dispatch) as two labeled options plus the "Other" free-text path. That avoids a two-step flow where a second question only exists to collect free text.
 
    - Question (single line): `Worker T-<id> exited via stuck-finding detection (attempt <meta.attempts> of <STUCK_REDISPATCH_CAP>). Pick an option below, OR select "Other" and paste guidance text to re-dispatch with a new Decisions entry.`
    - Include in the question body (via the question string itself — `AskUserQuestion` has no separate body field, so append context after a blank line): task title, log path, stuck excerpt from step 2, current Decisions section from step 3.
@@ -731,7 +864,7 @@ Every step below runs synchronously inside Step B's per-task drain loop — the 
    - Audit: `decision: "stuck-cleanup-failed"`, `source: "human-ask"`, `citation: null`, `reply: null`, `brokerOk: null`.
    - Remove from `RUNNING`. Continue the outer Step B drain loop. Do NOT attempt re-dispatch with stale artifacts in place.
 
-8. **Re-dispatch.** Reuse Step A steps 4–6 verbatim (capture pre-spawn `STARTED_AT`, spawn, verify-live, persist assigned) with two differences:
+8. **Re-dispatch.** Reuse Step A steps 4–6 verbatim (capture pre-spawn `STARTED_AT`, spawn, verify-live, persist assigned) with two differences. The Step A step 8 dispatch `chat_send` (pre-M6 §15.3) fires for the re-dispatch too with `attempt=<meta.attempts + 1>`, so a Discord watcher sees the re-spawn is a stuck recovery rather than an unrelated new dispatch.
    - The `attempts` field in step 6's BOARD update is set to `meta.attempts + 1`, not `1`. Clear `finished_at: null` and `exit_status: null` since this is a fresh attempt.
    - A fresh `STARTED_AT` is captured pre-spawn per Step A step 4's rule; the BOARD row's `started_at` and `RUNNING[<task_id>].started_at` both receive this new value. Capturing pre-spawn is non-negotiable for re-dispatch too: a re-dispatched worker that hits stuck in <3s would otherwise be classified against a post-spawn `started_at`, again filtering out its own closure.
    - The dispatch prompt (§P2.2) is re-assembled from the NOW-revised brief file — `wc -c` on the revised brief picks the inline-vs-read-the-file variant per the existing 4KB escape hatch. The prompt embedding always reads the current file content, so the guidance reaches the worker whether inline-embedded or read-on-demand.
@@ -756,11 +889,15 @@ Every step below runs synchronously inside Step B's per-task drain loop — the 
 
 ## Phase P3: Report
 
-Print a structured final summary:
+Pre-M6 §15.3 — before printing the textual summary, fire the run-end lifecycle `chat_send` per the P0.5 table (gated on `CHAT_SESSION_ID && !CHAT_DEGRADED`): merged count, blocked count, stranded count (tasks still in `PENDING_POOL`), duration (`UTC now - RUN_STARTED_AT`, rendered human-readable like `12m34s`), and the audit log path if `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` was written.
+
+Then — also before the textual report — call `mcp__ccx-chat__chat_close({sessionId: CHAT_SESSION_ID, status: <final>})` exactly once. Pick `status` from `approved | completed | stuck | aborted | error` per the rules in P0.5 step 7. This call MUST run in a `finally`-style block so it still fires if an earlier phase threw; if `CHAT_SESSION_ID` was never set (no `--chat`, or registration failed, or the MCP tool was unavailable), skip the close entirely.
+
+Then print a structured textual summary:
 
 - **Merged** (`<count>`): list `T-<id>` — `<title>` — `<duration>` — `attempts=<N>` (only when `attempts > 1`; omit the `attempts=` suffix for first-attempt merges to keep the common case clean). `attempts > 1` means the task was re-dispatched after a stuck exit and succeeded on a later attempt — worth surfacing so the human knows the M5 recovery earned its keep.
 - **Blocked** (`<count>`): list `T-<id>` — `<exit_status>` — log path (`.ccx/workers/T-<id>.log`) — `attempts=<N>` (suffix only when `N > 1`). Blocked reasons: `stale-artifact | spawn-error | merge-conflict | merge-aborted | merge-commit-failed | no-commit | error | stuck-exhausted | stuck-aborted | stuck-recovery-failed | stuck-cleanup-failed`. M-specific reasons:
-  - `merge-aborted` (M4): `git merge --no-commit --no-ff` refused the merge with no unmerged paths (pre-merge-commit hook rejection, branch protection, residual MERGE_HEAD, unreachable object). The supervisor does NOT set `STOP_DISPATCHING` here — failures of this shape are usually per-merge, so the loop keeps draining and other peers can still merge.
+  - `merge-aborted` (M4; algorithm updated to `git merge --squash` by pre-M6 §15.1): `git merge --squash` refused the merge with no unmerged paths (pre-merge-commit hook rejection, branch protection, unreachable object). The supervisor does NOT set `STOP_DISPATCHING` here — failures of this shape are usually per-merge, so the loop keeps draining and other peers can still merge.
   - `merge-commit-failed` (M4): the pre-merge dry-run reported clean but `git commit --no-edit` rejected the merge (typically a pre-commit hook on the integration branch); the supervisor sets `STOP_DISPATCHING` so no new workers spawn, drains existing `RUNNING` peers via Step B, then exits via condition 3. A recovery sidecar at `.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt` is written when the same condition is likely to break the Step D batch BOARD commit.
   - `stuck-exhausted` (M5): the task hit `STUCK_REDISPATCH_CAP` stuck exits in a single run. No human prompt fired on the final stuck because the cap gate in §P2.5 step 1 short-circuits it. Inspect `.ccx/workers/T-<id>.log` (both attempts' output is concatenated there per §P2.5's log-continuity rule) and revise the brief's `## Decisions` section manually before re-running the supervisor.
   - `stuck-aborted` (M5): a stuck exit was detected, the human was prompted, and they chose "Abort" (or supplied empty guidance, which the supervisor treats as abort). Log path is the final word; the human already made the call.
@@ -805,6 +942,6 @@ Do not add the deferred rows above to this command — they are tracked separate
 
 - M2 ships the broker plumbing (`plugins/ccx/mcp/ccx-chat/adapters/supervisor.mjs`, `backend: "supervisor"` config option, and the `chat_supervisor_{poll,reply,escalate,close}` MCP tools). With `backend: "supervisor"` in `~/.claude/ccx-chat/config.json`, worker `chat_ask` calls queue in the broker and auto-escalate to Discord after `supervisor.autoEscalateAfterSec` seconds (default 60).
 - M3 ships the supervisor-side polling (`Step B2`) and the match-confidence rubric (`§P2.3`). When the broker is in Discord-only mode OR the broker tool is unavailable, Step B2 is a no-op and worker asks reach humans via the broker's own 60s auto-escalate timer, preserving the M1 behavior.
-- M4 adds two independent gates that share no state: the scope-overlap gate (`Step A2 step 1a` + `§P2.4`) defers candidate dispatches whose `scope.include` shares any tracked file with a `RUNNING` task's snapshotted `scope_include`, and the pre-merge dry-run (`Step B step 3`) wraps every approved-worker merge in a `git merge --no-commit --no-ff` / `git commit --no-edit` pair so conflict detection happens before commit creation. Neither gate touches the audit log or the broker; both are pure repo-state operations.
+- M4 adds two independent gates that share no state: the scope-overlap gate (`Step A2 step 1a` + `§P2.4`) defers candidate dispatches whose `scope.include` shares any tracked file with a `RUNNING` task's snapshotted `scope_include`, and the pre-merge dry-run (`Step B step 3`) wraps every approved-worker merge in a `git merge --squash` + `git commit -m "T-<id>: <title>"` pair (pre-M6 §15.1; originally `git merge --no-commit --no-ff` + `git commit --no-edit`) so conflict detection happens before commit creation. Neither gate touches the audit log or the broker; both are pure repo-state operations.
 - M5 adds a closure-status ring buffer to the broker (`chat_supervisor_recent_closures`) plus a per-task stuck-recovery algorithm in the supervisor (`Step B step 4` stuck sub-classifier + `§P2.5`). On a worker's `no-commit` exit, the supervisor peels stuck exits out of the generic bucket by querying the ring buffer; first stuck per task triggers a local `AskUserQuestion` prompt, re-dispatch, and BOARD `attempts` increment; second stuck is terminal (`stuck-exhausted`). If the broker is Discord-only or the new MCP tool is unavailable, M5 degrades silently to M4's no-commit-equals-blocked behavior (`M5_DISABLED = true` run-level flag).
 - The audit log (`.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl`) is append-only JSONL, owned by the supervisor session, and committed by the supervisor's Step D batch commit alongside `BOARD.md`. M3 decisions (`decision: "reply" | "escalate"`) and M5 decisions (`decision: "stuck-recover" | "stuck-abort" | "stuck-exhausted" | "stuck-recovery-failed" | "stuck-cleanup-failed"`) share the file and are distinguishable by decision family. **Add `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` to the Step D staging set** so the run's decisions land on the integration branch atomically with the merge/block outcomes. Never truncate the file; never edit past lines.
