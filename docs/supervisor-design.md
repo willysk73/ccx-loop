@@ -140,7 +140,7 @@ order and when answering worker questions autonomously.
       - plugins/ccx/mcp/ccx-chat/adapters/*.mjs
       - plugins/ccx/mcp/ccx-chat/broker.mjs
     exclude: []
-  status: pending            # pending | assigned | review | merged | blocked
+  status: pending            # draft | pending | assigned | review | merged | blocked
   priority: normal           # low | normal | high
   depends_on: []             # other task ids that must be merged first
   brief: .ccx/tasks/T-12.md  # path to the per-task brief (§6)
@@ -160,7 +160,7 @@ Schema rules:
 
 - `id` is the **stable key**; supervisor never renames. Used as `--worktree=<id>` name, branch suffix, brief-file name, and log-file name.
 - `scope.include` is a list of globs. **Two tasks whose scope globs do not overlap can run in parallel**; overlapping scopes are serialized. This is how the supervisor prevents concurrent worktrees from producing conflicting merges.
-- `status` transitions: `pending → assigned → (review) → merged`. `blocked` is terminal and needs human action.
+- `status` transitions: `(draft →) pending → assigned → (review) → merged`. `draft` is the `/ccx:plan` output (M6) — a non-dispatchable status that exists to gate the human review step; the human flips `draft → pending` explicitly after reviewing the planned rows. `blocked` is terminal and needs human action.
 - `exit_status` mirrors `chat_close`'s status verb so merging logic can key off a single field.
 - BOARD is the **queue card**; fine-grained decisions and autonomous-answer lookup tables live in the brief (§6), not here.
 
@@ -433,7 +433,9 @@ M1 and M2 are enough to be useful. M3–M5 are runtime quality-of-life. The pre-
 
 ## 14. M6 — Planning phase (BOARD.md scaffolding from free-form input)
 
-Status: proposed (2026-04-18). Driven by the observation that after M1–M5 ship, the **only remaining human-authored artifact** is `BOARD.md`, and its schema (YAML-in-fenced-block, scope globs, depends_on, attempts) is plugin-internal knowledge. Forcing users to learn the schema before they can use the supervisor is the last onboarding cliff.
+Status: shipped (2026-04-18) as `plugins/ccx/commands/plan.md` + supervisor.md P1 updates. Driven by the observation that after M1–M5 ship, the **only remaining human-authored artifact** is `BOARD.md`, and its schema (YAML-in-fenced-block, scope globs, depends_on, attempts) is plugin-internal knowledge. Forcing users to learn the schema before they can use the supervisor is the last onboarding cliff.
+
+**Shipped shape:** `/ccx:plan <prompt>` or `/ccx:plan --from <path>` seeds a fresh `BOARD.md`; `/ccx:plan --append` extends an existing one. All new rows land as `status: draft`. Supervisor's P1 validator accepts `draft` as a valid status value but excludes it from dispatch (same bucket as `assigned | review | merged | blocked`). Missing-BOARD error at supervisor startup now points back at `/ccx:plan` instead of the design doc. No brief files are written by plan — that remains the supervisor's job at dispatch time. Direction-only edits stay manual per §14.3.6.
 
 ### 14.1 Problem
 
