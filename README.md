@@ -4,13 +4,14 @@ Claude Code plugin for automated dev loops with Codex review gates.
 
 Implement a task, get it reviewed by Codex, fix findings, repeat — then commit. All in one command.
 
-The plugin ships three commands:
+The plugin ships four commands:
 
 | Command | Behavior |
 |---------|----------|
 | `/ccx:loop`       | Run a fixed number of review-fix cycles (default 2). |
 | `/ccx:forever`    | Repeat review-fix cycles until Codex approves (safety cap default 100). |
-| `/ccx:supervisor` | Dispatch N parallel `/ccx:loop` workers from a shared `BOARD.md` (M1: dispatch + naive merge). |
+| `/ccx:plan`       | Seed (or extend with `--append`) `BOARD.md` task rows from a prompt or document — onboarding path for `/ccx:supervisor`. |
+| `/ccx:supervisor` | Dispatch N parallel `/ccx:loop` workers from a shared `BOARD.md` (dispatch + autonomous chat_ask + scope-overlap gate + pre-merge squash + stuck-exit auto-revise). |
 
 ## Install
 
@@ -75,13 +76,26 @@ This installs `discord.js` + MCP SDK into the plugin, creates `~/.claude/ccx-cha
 | `--min-confidence N` | Ignore findings with confidence < N (0.0–1.0) | `0.0` |
 | `--commit` | Auto-commit on clean approval (gated) | off |
 
-### `/ccx:supervisor` — parallel orchestrator (M1)
+### `/ccx:plan` — seed BOARD.md
 
 ```
-/ccx:supervisor [--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--dry-run]
+/ccx:plan <prompt> | --from <path> [--append]
 ```
 
-Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root. Each task gets its own worktree, brief file (`.ccx/tasks/T-<id>.md`), and merge commit on approval.
+Takes a free-form prompt or a reference to a document the user already wrote (PRD, design note, ticket export), grounds `scope.include` globs on actual repo files, and writes task rows to `BOARD.md` as `status: draft`. The human reviews the draft, flips `draft → pending`, commits, and then runs `/ccx:supervisor`. This is the onboarding path for the supervisor — no need to learn the BOARD YAML schema by hand.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--from <path>` | Read a file as the planning context (PRD/design note/etc). Relative paths resolve against the repo root. | (use positional prompt) |
+| `--append` | Extend an existing `BOARD.md` — new rows appended at the end of the `## Tasks` block; existing rows preserved byte-for-byte. | off (fresh seed) |
+
+### `/ccx:supervisor` — parallel orchestrator
+
+```
+/ccx:supervisor [--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--chat] [--dry-run]
+```
+
+Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root. Each task gets its own worktree, brief file (`.ccx/tasks/T-<id>.md`), and a squash merge commit on approval. Worker `chat_ask` calls are intercepted by the broker and answered autonomously from the brief / BOARD direction / merge history when possible; ambiguous asks escalate to Discord.
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -89,9 +103,10 @@ Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root.
 | `--integration BRANCH` | Branch merges land on | current branch |
 | `--max-tasks M` | Stop after M merges | unlimited |
 | `--worker-loops N` | `--loops N` passed to each worker (1–20) | 5 |
+| `--chat` | Register a supervisor session with the ccx-chat broker and post lifecycle events (dispatch, merge, block, stuck prompt, run end) to Discord | off |
 | `--dry-run` | Print dispatch plan, don't commit or spawn | off |
 
-**M1 scope** is dispatch-only: BOARD → briefs → `claude -p` workers → naive merge. No `chat_ask` interception (M2), autonomous answering (M3), or scope-overlap gating (M4). See `docs/supervisor-design.md` for the full design.
+Milestones shipped: M1 dispatch + naive merge, M2 broker supervisor adapter, M3 autonomous chat_ask answering, M4 scope-overlap gate + pre-merge dry-run, M5 stuck-exit auto-revise + re-dispatch, M6 `/ccx:plan` onboarding (separate command above). See `docs/supervisor-design.md` for the full design.
 
 ### Examples
 
