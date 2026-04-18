@@ -201,6 +201,42 @@ async function main() {
   const messageToSession = new Map();
   const messageToAsk = new Map();
 
+  // Ring buffer of recent chat_close events. Consumed by
+  // `chat_supervisor_recent_closures` so a supervisor session can distinguish
+  // stuck / cap-hit / filtered-clean exits after a worker terminates (the
+  // registry itself deletes the session on close, so status would otherwise
+  // be unrecoverable). Kept in memory — closures are only interesting for the
+  // lifetime of the current supervisor run; broker restart is allowed to
+  // forget them.
+  //
+  // Sizing: the cap is generous enough that a realistic long supervisor run
+  // (or several concurrent supervisors sharing the host broker) cannot evict
+  // a worker's closure before the supervisor's Step B inspects it, which
+  // would silently downgrade stuck exits to generic no-commit. Per-entry
+  // memory is ~300 bytes including timestamps, so 8192 entries ≈ 2–3 MiB —
+  // negligible compared to anything else the broker holds. In parallel,
+  // `pushClosure` GCs entries older than 24h on every push so historical
+  // closures do not linger past any realistic re-run window; 24h covers
+  // overnight supervisor sessions and all in-flight worker lifetimes.
+  const RECENT_CLOSURES_CAP = 8192;
+  const RECENT_CLOSURES_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  const recentClosures = [];
+  function pushClosure(entry) {
+    recentClosures.push(entry);
+    const cutoff = Date.now() - RECENT_CLOSURES_MAX_AGE_MS;
+    // Drop any leading entries older than the 24h cutoff. Since entries are
+    // appended in wall-clock order, a simple prefix-shift is correct — no
+    // full-array scan is needed except in pathological cases where the
+    // system clock jumped backwards (rare, and closures older than the new
+    // cutoff would simply persist until the next push advances the cutoff).
+    while (recentClosures.length > 0 && Date.parse(recentClosures[0].at) < cutoff) {
+      recentClosures.shift();
+    }
+    if (recentClosures.length > RECENT_CLOSURES_CAP) {
+      recentClosures.splice(0, recentClosures.length - RECENT_CLOSURES_CAP);
+    }
+  }
+
   const sessionMeta = new Map();
   function markCancelled(id, reason) {
     registry.cancelled.set(id, { reason, at: Date.now() });
@@ -442,6 +478,15 @@ async function main() {
       await discordReadyPromise;
       return {};
     },
+    // Introspection for the MCP server: lists every RPC name the broker
+    // understands. The MCP server uses this at connect time to filter the
+    // tool list it advertises to Claude, so a new server talking to an older
+    // already-running broker does NOT surface tools whose backing op doesn't
+    // exist (calling them would otherwise fail at use-time with "unknown op"
+    // and silently degrade features like M5 stuck recovery).
+    async capabilities() {
+      return { ops: Object.keys(ops).sort() };
+    },
     async register({ label, cwd, branch, channelId }) {
       const targetChannel = channelId ?? config.discord.channelId;
       const color = pickColor(targetChannel, registry);
@@ -615,6 +660,21 @@ async function main() {
         }
         sessionMeta.delete(sessionId);
       }
+      // Record BEFORE registry.close wipes the session — the supervisor's
+      // stuck-recovery path needs `branch`, `cwd`, and `label` to attribute
+      // the closure to a task id that no longer exists in the registry. `cwd`
+      // is load-bearing: the broker is host-global, so two different repos
+      // (or the same repo in different checkouts) can each run a task whose
+      // worker branch happens to be `ccx/T-1`; without cwd, a closure from
+      // one supervisor run could misclassify a worker of another as stuck.
+      pushClosure({
+        sessionId,
+        cwd: session.cwd ?? null,
+        branch: session.branch ?? null,
+        label: session.label ?? null,
+        status: status ?? 'closed',
+        at: new Date().toISOString(),
+      });
       supervisor?.dropSession(sessionId);
       registry.close(sessionId);
       clearCancelled(sessionId);
@@ -640,6 +700,41 @@ async function main() {
       if (!supervisor) throw new Error('broker is not in supervisor mode');
       if (!askId) throw new Error('supervisorClose: askId is required');
       return { ok: supervisor.close(askId) };
+    },
+    async supervisorRecentClosures({ cwd, branch, since, limit } = {}) {
+      if (!supervisor) throw new Error('broker is not in supervisor mode');
+      // Server-side filtering: the supervisor scopes its match by
+      // (cwd, branch, since) anyway, so applying those filters in the broker
+      // keeps the wire payload bounded even if recentClosures grows to its
+      // RECENT_CLOSURES_CAP. Without this, a long-lived host broker with
+      // thousands of closures in the buffer would ship the entire buffer on
+      // every Step B `no-commit` exit, easily blowing MCP/tool output
+      // budgets and silently downgrading stuck recovery to generic no-commit.
+      const sinceMs = typeof since === 'string' ? Date.parse(since) : null;
+      const sinceValid = Number.isFinite(sinceMs);
+      const maxLimit = 256;
+      const defaultLimit = 64;
+      const capped = Math.min(
+        maxLimit,
+        Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : defaultLimit),
+      );
+      const filtered = [];
+      // Iterate newest-first so `capped` results are the most recent matches;
+      // the supervisor only needs the latest entry per (cwd, branch) anyway.
+      for (let i = recentClosures.length - 1; i >= 0 && filtered.length < capped; i -= 1) {
+        const c = recentClosures[i];
+        if (typeof cwd === 'string' && c.cwd !== cwd) continue;
+        if (typeof branch === 'string' && c.branch !== branch) continue;
+        if (sinceValid) {
+          const atMs = Date.parse(c.at);
+          if (!Number.isFinite(atMs) || atMs < sinceMs) continue;
+        }
+        filtered.push(c);
+      }
+      // Return in chronological order so callers relying on "last entry is
+      // latest" semantics (§P2.5's classifier) work unchanged.
+      filtered.reverse();
+      return { closures: filtered };
     },
     async smoketest({ text } = {}) {
       const ids = await adapter.send(text ?? '✅ ccx-chat smoke test — Discord bridge is live.');

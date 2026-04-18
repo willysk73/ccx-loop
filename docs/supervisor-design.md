@@ -144,6 +144,7 @@ order and when answering worker questions autonomously.
   priority: normal           # low | normal | high
   depends_on: []             # other task ids that must be merged first
   brief: .ccx/tasks/T-12.md  # path to the per-task brief (§6)
+  attempts: 0                # supervisor-managed (M5); starts at 1 on first dispatch, increments on stuck re-dispatch
   worktree: null             # filled in when dispatched
   branch: null
   worker_pid: null
@@ -417,11 +418,11 @@ Phases inside `/ccx:supervisor`:
 
 ## 13. MVP milestones
 
-1. **M1 — dispatch only.** `/ccx:supervisor` reads `BOARD.md`, generates `.ccx/tasks/T-<id>.md` from a template, spawns workers with `claude -p … /ccx:loop --worktree --commit --chat` using the XML-wrapped dispatch prompt from §7, polls shell exit, marks status `merged` on `approved` exit (naive merge, no conflict handling). No escalation, no socket, no autonomous answering. Human handles any `chat_ask` directly via the existing Discord path.
-2. **M2 — supervisor adapter + escalation.** Add `adapters/supervisor.mjs`, broker config gains `backend: "supervisor"`, `/ccx:supervisor` reads forwarded `chat_ask` events and escalates to Discord. Autonomous answering still stubbed — everything escalates.
-3. **M3 — autonomous answering.** Supervisor consults the brief's `## Decisions`, BOARD direction, and prior merge commit messages to answer without escalating. Log every autonomous answer so the human can audit.
-4. **M4 — scope conflict detection.** Scope glob overlap check gates parallelism. Pre-merge conflict dry-run (`git merge --no-commit --no-ff <branch>`, then `git merge --abort`) before committing the merge.
-5. **M5 — stuck recovery.** On `stuck` exit, supervisor can optionally revise the brief's Decisions section (from the stuck-finding content) and re-dispatch, or escalate if the revision would require human judgement.
+1. **M1 — dispatch only** (shipped 2026-04-17, commit `873dc5c`). `/ccx:supervisor` reads `BOARD.md`, generates `.ccx/tasks/T-<id>.md` from a template, spawns workers with `claude -p … /ccx:loop --worktree --commit --chat` using the XML-wrapped dispatch prompt from §7, polls shell exit, marks status `merged` on `approved` exit (naive merge, no conflict handling). No escalation, no socket, no autonomous answering. Human handles any `chat_ask` directly via the existing Discord path.
+2. **M2 — supervisor adapter + escalation** (shipped 2026-04-17, commit `a6ea2fe`). `adapters/supervisor.mjs`, broker config `backend: "supervisor"`, and `chat_supervisor_{poll,reply,escalate,close}` MCP tools land. Workers' `chat_ask` calls queue in the broker and auto-escalate to Discord after `supervisor.autoEscalateAfterSec` seconds (default 60); the supervisor-side polling stub is present but everything escalates.
+3. **M3 — autonomous answering** (shipped 2026-04-17, commit `7e4b8bc`). Supervisor consults the brief's `## Decisions`, BOARD direction, and prior worker commits on the integration branch to answer without escalating. Every decision lands in `.ccx/supervisor-audit/<RUN_ID>.jsonl` for audit.
+4. **M4 — scope conflict detection** (shipped 2026-04-17, commit `573e39c`). Scope glob overlap check gates parallelism via `git ls-files -- <pathspecs>` intersection with literal and prefix fallbacks. Pre-merge conflict dry-run (`git merge --no-commit --no-ff <branch>` then `git commit --no-edit` or `git merge --abort`) separates conflict detection from commit creation. New blocked reasons: `merge-aborted`, `merge-commit-failed` (the latter sets `STOP_DISPATCHING` and drains existing peers via new exit condition 3).
+5. **M5 — stuck recovery** (shipped 2026-04-17). Broker records every `chat_close` status in an in-memory ring buffer (`chat_supervisor_recent_closures` MCP tool, capped at 256 entries). Supervisor Step B peels stuck exits out of the generic `no-commit` bucket by querying the buffer. First stuck per task triggers a single `AskUserQuestion` (three-way: re-dispatch with guidance via "Other", re-dispatch unchanged, abort); on guidance the supervisor appends a `## Decisions` entry, commits the revised brief, cleans the prior worktree+branch, and re-spawns. `STUCK_REDISPATCH_CAP = 2` hard-caps at one re-dispatch; a second stuck blocks as `stuck-exhausted`. New blocked reasons: `stuck-exhausted`, `stuck-aborted`, `stuck-recovery-failed`, `stuck-cleanup-failed`. BOARD rows gain an `attempts` field (optional, normalized to 0).
 
 M1 and M2 are enough to be useful. M3–M5 are quality-of-life.
 

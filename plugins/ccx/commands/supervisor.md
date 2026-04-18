@@ -1,12 +1,12 @@
 ---
-description: "Orchestrate N parallel /ccx:loop workers from BOARD.md — M4: dispatch + autonomous chat_ask + scope-overlap gate + pre-merge dry-run"
+description: "Orchestrate N parallel /ccx:loop workers from BOARD.md — M5: dispatch + autonomous chat_ask + scope-overlap gate + pre-merge dry-run + stuck-exit auto-revise"
 argument-hint: "[--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--dry-run]"
-allowed-tools: Bash, BashOutput, Read, Write, Edit, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate, mcp__ccx-chat__chat_supervisor_poll, mcp__ccx-chat__chat_supervisor_reply, mcp__ccx-chat__chat_supervisor_escalate, mcp__ccx-chat__chat_supervisor_close
+allowed-tools: Bash, BashOutput, Read, Write, Edit, Glob, Grep, AskUserQuestion, TaskCreate, TaskUpdate, mcp__ccx-chat__chat_supervisor_poll, mcp__ccx-chat__chat_supervisor_reply, mcp__ccx-chat__chat_supervisor_escalate, mcp__ccx-chat__chat_supervisor_close, mcp__ccx-chat__chat_supervisor_recent_closures
 ---
 
-# /ccx:supervisor — Parallel Worker Orchestrator (M4)
+# /ccx:supervisor — Parallel Worker Orchestrator (M5)
 
-One human drives N parallel `/ccx:loop` workers from a shared `BOARD.md`. Each task runs in its own git worktree, gets its own brief file, and merges back into the integration branch on approval. Worker `chat_ask` calls are intercepted by the broker; the supervisor session answers from the brief / BOARD / merge history when possible, escalating to Discord only when no deterministic answer fits. Tasks whose scope globs touch overlapping files are serialized at dispatch time so concurrent worktrees do not produce conflicting merges, and every merge is staged via a `--no-commit` dry-run before it is finalized.
+One human drives N parallel `/ccx:loop` workers from a shared `BOARD.md`. Each task runs in its own git worktree, gets its own brief file, and merges back into the integration branch on approval. Worker `chat_ask` calls are intercepted by the broker; the supervisor session answers from the brief / BOARD / merge history when possible, escalating to Discord only when no deterministic answer fits. Tasks whose scope globs touch overlapping files are serialized at dispatch time so concurrent worktrees do not produce conflicting merges, and every merge is staged via a `--no-commit` dry-run before it is finalized. When a worker exits via stuck-finding detection, the supervisor prompts the human once for guidance, appends that guidance to the brief's `## Decisions` section, and re-dispatches the same task one time before giving up.
 
 Raw arguments: `$ARGUMENTS`
 
@@ -15,11 +15,11 @@ Raw arguments: `$ARGUMENTS`
 - **M1 — dispatch.** `BOARD.md` → briefs → `claude -p` workers → naive `--no-ff` merge → batch BOARD update.
 - **M2 — broker supervisor adapter.** `backend: "supervisor"` in `~/.claude/ccx-chat/config.json` queues worker asks in the broker and exposes `chat_supervisor_{poll,reply,escalate,close}` MCP tools, with a per-ask auto-escalate timer as the no-supervisor-session fallback.
 - **M3 — autonomous answering.** `/ccx:supervisor` polls the broker's supervisor queue every scheduling iteration. For each pending ask it consults the task brief's `## Decisions` table, BOARD `## Direction`, and the integration branch's merge-commit history. A confident deterministic match → `chat_supervisor_reply`; otherwise → `chat_supervisor_escalate` (human answers on Discord). Every supervisor decision is appended as JSONL to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can audit after the fact.
-- **M4 — scope-overlap gate + pre-merge dry-run (this milestone).** Step A defers any pending task whose `scope.include` matches a tracked file already claimed by a `RUNNING` task — overlap is computed by intersecting the two `git ls-files -- <pathspecs>` results plus a literal-glob equality fallback for globs that match no current files. Deferred tasks stay in `PENDING_POOL` and are retried next iteration when slots free; nothing is marked `blocked`. Step B's merge stages the integration branch via `git merge --no-commit --no-ff --no-edit`, inspects unmerged paths, and either finalizes with `git commit --no-edit` (clean) or `git merge --abort` (conflict) — separating conflict detection from commit creation. The conflict path remains identical to M3.
+- **M4 — scope-overlap gate + pre-merge dry-run.** Step A defers any pending task whose `scope.include` matches a tracked file already claimed by a `RUNNING` task — overlap is computed by intersecting the two `git ls-files -- <pathspecs>` results plus a literal-glob equality fallback for globs that match no current files. Deferred tasks stay in `PENDING_POOL` and are retried next iteration when slots free; nothing is marked `blocked`. Step B's merge stages the integration branch via `git merge --no-commit --no-ff --no-edit`, inspects unmerged paths, and either finalizes with `git commit --no-edit` (clean) or `git merge --abort` (conflict) — separating conflict detection from commit creation.
+- **M5 — stuck-exit auto-revise + re-dispatch (this milestone).** Worker `chat_close({status: "stuck"})` is now recoverable in bounded cases. The broker records every `chat_close` status in an in-memory ring buffer (`chat_supervisor_recent_closures` MCP tool); Step B queries it after a `no-commit` classification to peel off stuck exits from the broader cap-hit / filtered-clean / aborted bucket. On the first stuck exit per task, the supervisor prompts the human (via `AskUserQuestion`) with the stuck-finding details tailed from the worker log and offers three outcomes — re-dispatch with guidance, re-dispatch unchanged, or abort. Re-dispatch with guidance appends the human's text to the brief's `## Decisions` section, commits the revised brief, cleans the prior worktree+branch, and re-spawns the worker; the BOARD row's `attempts` counter increments. A second stuck exit on the same task classifies as `stuck-exhausted` and blocks without prompting — one re-dispatch is the hard cap. See §P2.5.
 
-Still deferred (out of scope for M4):
+Still deferred (out of scope for M5):
 
-- Stuck-exit auto-revise brief and re-dispatch (M5).
 - Supervisor-session resume after close (stretch).
 
 SSOT for all design decisions: `docs/supervisor-design.md`. Read it before editing this command.
@@ -77,7 +77,7 @@ If anything fails, print the exact error and stop. No partial setup.
 1. Read `REPO_ROOT/BOARD.md`. Extract:
    - The `## Direction` section (everything from the line after `## Direction` up to the next `## ` heading or EOF). Store as `DIRECTION_TEXT`. May be empty.
    - The single YAML fenced code block under `## Tasks`. Parse it as a YAML array. If parsing fails or multiple fenced blocks appear under `## Tasks`, STOP with the parse error.
-2. Validate each task entry. **Required** fields: `id` (string matching `^T-[0-9]+$`), `title` (non-empty string), `status` (one of `pending | assigned | review | merged | blocked`), `scope.include` (non-empty array of strings). **Optional** with defaults: `scope.exclude` (`[]`), `priority` (`normal`, one of `high | normal | low`), `depends_on` (`[]`, array of task ids), `brief` (`.ccx/tasks/<id>.md`), `notes` (`""`).
+2. Validate each task entry. **Required** fields: `id` (string matching `^T-[0-9]+$`), `title` (non-empty string), `status` (one of `pending | assigned | review | merged | blocked`), `scope.include` (non-empty array of strings). **Optional** with defaults: `scope.exclude` (`[]`), `priority` (`normal`, one of `high | normal | low`), `depends_on` (`[]`, array of task ids), `brief` (`.ccx/tasks/<id>.md`), `notes` (`""`), `attempts` (`0`, non-negative integer — supervisor-managed counter used by M5 stuck recovery; humans never need to set this, but a missing or null field must be accepted and normalized to `0` so existing BOARDs authored before M5 continue to parse).
 
    **Glob-string contract** (used by M4's overlap gate, §P2.4): every entry in `scope.include` and `scope.exclude` MUST be a non-empty string that contains no NUL byte and no newline character — those are the two characters that would break `git ls-files -z` output parsing. All other characters (including single-quote `'`, double-quote `"`, spaces, `$`, backtick) are permitted because §P2.4 mandates exec/argv invocation; single-quote in particular is a legal character in committed Git paths (e.g. `docs/engineer's-guide.md`) and rejecting it would be a regression in accepted task scopes.
 
@@ -103,7 +103,8 @@ If anything fails, print the exact error and stop. No partial setup.
 State:
 
 - `SLOTS = --parallel N`
-- `RUNNING = {}` — map `task_id -> { shell_id, worktree_path, branch, log_path, started_at, scope_include }`. `scope_include` is the BOARD row's `scope.include` glob list (a list of strings, copied verbatim at dispatch time), used by Step A's scope-overlap gate to detect which currently-running task already claims the files a candidate task would touch.
+- `STUCK_REDISPATCH_CAP = 2` — hard cap on per-task dispatch attempts (M5). First dispatch counts as 1; one re-dispatch after a stuck exit is allowed; a second stuck exit blocks the task as `stuck-exhausted` without prompting. Hardcoded for M5 MVP — a CLI flag is a later tuning knob.
+- `RUNNING = {}` — map `task_id -> { shell_id, worktree_path, branch, log_path, started_at, scope_include, attempts }`. `scope_include` is the BOARD row's `scope.include` glob list (a list of strings, copied verbatim at dispatch time), used by Step A's scope-overlap gate to detect which currently-running task already claims the files a candidate task would touch. `attempts` starts at `1` on first dispatch (Step A step 6) and is incremented in place by §P2.5's re-dispatch path; it is the in-memory mirror of the BOARD row's `attempts` field and is used by Step B to enforce `STUCK_REDISPATCH_CAP`.
 - `DISPATCHED = set()` — every `<TASK_ID>` this supervisor has launched in this run (populated in Step A step 7, never removed). Used by Step B2's ownership filter so asks from workers that exit between ask-time and the next poll are still recognized as ours.
 - `MERGED_COUNT = 0`
 - `MERGED_IDS = []`, `BLOCKED_IDS = []`
@@ -150,7 +151,9 @@ A2. **Skip A2 entirely when `STOP_DISPATCHING == true`** — no slot-fill, no ov
    - `git add -- .ccx/tasks/<TASK.id>.md`
    - `git commit -m "supervisor: prepare <TASK.id> <TASK.title> — brief"`
    - If the commit fails (pre-commit hook, etc.), STOP the whole run and report — the brief file stays on disk but uncommitted; the task stays `pending`.
-4. **Spawn the worker** with `Bash(run_in_background=true)`:
+4. **Capture `STARTED_AT` BEFORE spawning.** Record `STARTED_AT = <UTC now ISO 8601>` immediately, before the Bash spawn call below. Steps 6 and 7 MUST both use this same `STARTED_AT` value — not a re-sampled "now" timestamp. Rationale: §P2.5's stuck classifier requires `closure.at >= meta.started_at` to distinguish a fresh stuck exit from a stale closure in the broker's ring buffer. If the worker exits stuck very quickly (within the 3s liveness check, or during the `assigned` BOARD commit, or if a local config file makes `claude -p` crash fast), its `chat_close` `at` timestamp will be older than a "now" sampled at step 6 — and the classifier would filter out exactly the fast-fail stuck events M5 is meant to recover. Sampling `STARTED_AT` pre-spawn closes that window.
+
+   Then spawn the worker with `Bash(run_in_background=true)`:
 
    ```bash
    cd "<REPO_ROOT>" && claude -p \
@@ -182,10 +185,10 @@ A2. **Skip A2 entirely when `STOP_DISPATCHING == true`** — no slot-fill, no ov
      - **Remove `<TASK.id>` from `PENDING_POOL`** per the pool-removal rule — the in-memory BOARD is now `blocked` but not yet persisted, so A1 would otherwise re-select this task and re-attempt the spawn.
    - Otherwise the shell is running (or completed with exit 0 — exceedingly unlikely for a Codex-gated worker in 3 seconds, but also not a failure). Proceed.
 6. **Persist the `assigned` state** on the integration branch:
-   - In-memory edit: set the BOARD row's `status: "assigned"`, `worktree: "<REPO_ROOT>-<TASK.id>"`, `branch: "ccx/<TASK.id>"`, `started_at: "<UTC now ISO 8601>"`. Edit must be read-YAML-block → modify in memory → re-emit → replace the exact YAML block. Preserve sibling rows byte-for-byte.
+   - In-memory edit: set the BOARD row's `status: "assigned"`, `worktree: "<REPO_ROOT>-<TASK.id>"`, `branch: "ccx/<TASK.id>"`, `started_at: "<STARTED_AT from step 4>"`, `attempts: 1` (M5 — first dispatch counts as attempt 1; §P2.5's re-dispatch path increments on subsequent attempts). Do NOT re-sample "now" here; reuse the `STARTED_AT` captured pre-spawn so the M5 classifier window covers the entire lifetime of the worker including the 3s liveness check. Edit must be read-YAML-block → modify in memory → re-emit → replace the exact YAML block. Preserve sibling rows byte-for-byte.
    - `git add -- BOARD.md` and `git commit -m "supervisor: dispatch <TASK.id> <TASK.title>"`.
    - If this commit fails, the worker is already running — log the error, leave the worker alone (it will eventually finish and be picked up by Step B), and STOP the whole run. Do NOT kill the worker; its log and branch are preserved for manual recovery.
-7. Write `RUNNING[TASK.id] = { shell_id: SHELL_ID, worktree_path: "<REPO_ROOT>-<TASK.id>", branch: "ccx/<TASK.id>", log_path: ".ccx/workers/<TASK.id>.log", started_at, scope_include: TASK.scope.include }` AND add `TASK.id` to the `DISPATCHED` set. The `scope_include` field is a verbatim copy of the BOARD row's glob list captured at dispatch time — Step A's overlap gate (§P2.4) reads it on every subsequent pass, so it MUST snapshot the value rather than re-read BOARD (a concurrent BOARD edit between dispatch and the next pass would otherwise change the overlap picture under the supervisor). `DISPATCHED` is never removed from — it's the ownership source of truth for Step B2's filter across the whole run. Remove `<TASK.id>` from `PENDING_POOL`.
+7. Write `RUNNING[TASK.id] = { shell_id: SHELL_ID, worktree_path: "<REPO_ROOT>-<TASK.id>", branch: "ccx/<TASK.id>", log_path: ".ccx/workers/<TASK.id>.log", started_at: STARTED_AT, scope_include: TASK.scope.include, attempts: 1 }` (reuse the SAME `STARTED_AT` captured in step 4) AND add `TASK.id` to the `DISPATCHED` set. The `scope_include` field is a verbatim copy of the BOARD row's glob list captured at dispatch time — Step A's overlap gate (§P2.4) reads it on every subsequent pass, so it MUST snapshot the value rather than re-read BOARD (a concurrent BOARD edit between dispatch and the next pass would otherwise change the overlap picture under the supervisor). The `attempts` field mirrors the BOARD row's `attempts: 1` just written in step 6; §P2.5 increments both in lockstep on re-dispatch. `DISPATCHED` is never removed from — it's the ownership source of truth for Step B2's filter across the whole run. Remove `<TASK.id>` from `PENDING_POOL`.
 8. Print a one-line dispatch notice: `dispatched <TASK.id> (<TASK.title>) → shell <SHELL_ID>, log <log_path>`.
 
 ### Step B — Drain completions
@@ -297,7 +300,47 @@ For each `(task_id, meta)` in `RUNNING`:
 
    The dry-run does NOT replace the abort-on-conflict guarantee — the conflict-capture order in §3 step 3 below is unchanged. The dry-run adds a bounded "clean merge prepared but not yet committed" window; that window MUST be closed by either `git commit --no-edit` or `git merge --abort` before Step B moves to the next `(task_id, meta)`. Never leave a partial merge state across loop iterations — Step B's own next iteration would observe the residual `MERGE_HEAD` and either fail to start a new merge or compound the unfinalized one.
 
-4. For **no-commit** / **error**: append to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "no-commit"` or `"error"`, `notes: "see .ccx/workers/<task_id>.log"`. (`PENDING_POOL` already has this task removed from Step A step 7; the pool-removal rule requires nothing further here.)
+4. For **no-commit**: check whether this was a stuck-finding exit before marking blocked.
+
+   **M5 stuck sub-classification.** `/ccx:loop` calls `chat_close({status: "stuck"})` when stuck-finding detection fires and `chat_close({status: ...})` with other verbs (`filtered-clean`, `cap-hit`, `aborted`) for the other `no-commit` reasons. The supervisor queries the broker's recent-closures ring buffer (populated by the `close()` handler on every `chat_close` call) to distinguish these. If the closure record for `branch == "ccx/<task_id>"` shows `status == "stuck"`, hand the task to the §P2.5 stuck-recovery algorithm INSTEAD of marking blocked. Any other status — or any failure to query the buffer — falls through to the generic no-commit handling below.
+
+   ```
+   closures = try mcp__ccx-chat__chat_supervisor_recent_closures({
+                cwd: meta.worktree_path,
+                branch: "ccx/<task_id>",
+                since: meta.started_at,
+                limit: 16,
+              })
+              catch → skip to generic no-commit handling
+   scopedClosures = closures.closures sorted by `at` ascending
+   latest = last entry of scopedClosures, or null if none
+   if latest != null AND latest.status == "stuck":
+       hand off to §P2.5 — do NOT fall through
+   else:
+       fall through to generic no-commit handling below
+   ```
+
+   **Server-side filter parameters are mandatory for M5 scale.** Pass `cwd`, `branch`, and `since` as shown — do NOT call the tool with an empty params object and filter client-side. The broker's ring buffer can hold up to 8192 entries (24h of closures across every concurrent session on the host); shipping the whole buffer through MCP on every Step B `no-commit` exit would routinely exceed tool/model output budgets, at which point the supervisor's Step B query falls back to the generic no-commit path and M5 silently stops working on realistic workloads. The broker applies these filters identically to the client-side rules described in "Three-dimension scoping" below, so the returned `closures` list is already scoped to this worker's attempt — the supervisor only needs to sort by `at` and pick the tail entry. `limit: 16` is generous for the single-worker single-attempt case (one expected entry) while still tolerating any transient over-reporting.
+
+   **Three-dimension scoping (all required).** The closure ring buffer is broker-wide — shared across every `/ccx:supervisor` and `/ccx:loop` session on the host, and retained in memory across supervisor runs. A loose match would pick up stale entries that have nothing to do with this worker's actual exit. The three filters below are independent and all must apply:
+
+   1. **`cwd == meta.worktree_path`** — the broker is host-global, so two checkouts of different repos (or the same repo under two checkout paths) can each launch a worker whose branch is `ccx/T-1`. Without this filter, a stuck exit in repo A could misclassify a worker in repo B. `meta.worktree_path` was captured at dispatch time (Step A step 7) as the absolute path `<REPO_ROOT>-<task_id>`, which is also exactly the `cwd` that `/ccx:loop --worktree` passes to `chat_register`. Exact-equality on cwd scopes the match to this supervisor's repo unambiguously.
+
+   2. **`branch == "ccx/<task_id>"`** — obvious task-level scoping.
+
+   3. **`at >= meta.started_at`** — closures survive broker restarts within the in-memory ring (they do not survive a broker process restart, but they survive across `/ccx:supervisor` invocations as long as the broker stays alive). A rerun of the same task id after a prior run could otherwise hit an old `stuck` closure from the prior run if the current worker exits `no-commit` without ever calling `chat_close` (broker unreachable, worker crash-before-close, etc.) — the ring buffer would still hold the prior run's `stuck` entry and the classifier would pipe the current fresh `no-commit` into §P2.5 even though THIS attempt never reported stuck. `meta.started_at` was captured at dispatch time (initial: Step A step 6; re-dispatch: §P2.5 step 9's in-place update) and is guaranteed to be later than every closure from a prior attempt or prior run on the same branch. `at` and `started_at` are both UTC ISO 8601 strings — lexicographic comparison is safe because UTC ISO 8601 is monotonic.
+
+   **Latest-match rule (on the scoped set).** After all three filters, the lookup MUST pick the most recent remaining closure and then check `status == "stuck"` on THAT single record — NOT scan for any stuck entry in the scoped set. After a stuck-triggered re-dispatch (§P2.5 step 8) the worker keeps the same branch name `ccx/<task_id>`, so a subsequent non-stuck exit (e.g. the second attempt exits with `cap-hit` or `filtered-clean`) appends a fresh closure record alongside the earlier stuck record and both entries pass the cwd/branch/started_at filter. A loose "find any stuck in the scoped set" match would re-route that second exit into §P2.5 even though the live exit was not stuck, and §P2.5 step 1's `attempts >= STUCK_REDISPATCH_CAP` gate would then block the task as `stuck-exhausted` — a misclassification that hides the real exit reason from the human and from P3 reporting. Sorting the scoped set by `at` ascending and taking the tail entry is the contract; equivalently, `max(scopedClosures, key = at)`. The broker preserves insertion order when pushing, so for buffers under the cap this is already `scopedClosures[scopedClosures.length - 1]`; sort explicitly anyway to make the contract robust against future buffer reordering (e.g. if the buffer is ever extended to evict oldest-by-timestamp instead of oldest-by-insertion).
+
+   Rationale for the fallthrough on query failure: stuck recovery is best-effort. If the broker is in Discord-only mode, the `chat_supervisor_recent_closures` tool is unavailable and M5 silently degrades to the M4 behavior (mark blocked, human handles manually). If the tool is available but errors transiently, the task is still correctly classified as `no-commit` — the human loses the auto-revise convenience for this run but no data is lost.
+
+   **Tool-availability gate.** Before the first query, verify `mcp__ccx-chat__chat_supervisor_recent_closures` is in the session's available tool surface (same check Step B2 performs for `chat_supervisor_poll`). If absent, set a run-level flag `M5_DISABLED = true`, log once `M5 stuck recovery disabled: chat_supervisor_recent_closures tool unavailable`, and skip every subsequent per-task stuck query for the remainder of the run. This mirrors Step B2's `SKIP_B2` pattern — avoid hammering an MCP surface that is definitively missing.
+
+   **Stale-broker degradation (call-time safety net).** Even when the tool IS advertised, a stale detached broker from an older install may be holding the socket — the MCP server can only filter its advertised tool list if the broker's capability probe completed before `listTools` ran. When the supervisor's query errors with a message matching `requires a newer ccx-chat broker` or `unknown op: supervisorRecentClosures` (substring, case-insensitive), treat that as equivalent to the tool being unavailable: set `M5_DISABLED = true`, log once `M5 stuck recovery disabled: ccx-chat broker is out of date — restart it with 'pkill -f ccx-chat/broker.mjs' and re-run the supervisor`, and fall through to the generic no-commit handling for this task (and every subsequent no-commit task this run). Without this recognition, every stuck worker after an upgrade-server-but-not-restart-broker event would repeatedly re-encounter the same error and mis-classify as generic no-commit with a confusing stderr trail; treating it as M5_DISABLED surfaces one clear restart instruction and degrades cleanly. Any OTHER error (timeout, transient IPC drop) remains a per-task fallthrough to no-commit per the existing "Rationale for the fallthrough on query failure" clause — only the stale-broker signatures are sticky.
+
+   **Generic no-commit handling** (reached when the stuck sub-classifier does not trigger): append to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "no-commit"`, `notes: "see .ccx/workers/<task_id>.log"`. (`PENDING_POOL` already has this task removed from Step A step 7; the pool-removal rule requires nothing further here.)
+
+   **For error:** append to `BLOCKED_IDS`. Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "error"`, `notes: "see .ccx/workers/<task_id>.log"`. The M5 stuck sub-classifier is NOT consulted for `error` outcomes — a non-zero shell exit means the worker crashed before it could call `chat_close`, so the closure ring buffer has no entry to examine and re-dispatch would almost certainly hit the same crash again.
 
 5. Remove `task_id` from `RUNNING`.
 6. Print a one-line completion notice summarizing outcome + duration + log path.
@@ -594,23 +637,142 @@ Step A's overlap gate (A2 step 1a) decides whether `TASK.scope.include` overlaps
 
 The gate intentionally does NOT enumerate the cross product of every `READY` task pair — only the popped candidate against currently `RUNNING` tasks. Two `READY` tasks that overlap with each other but neither with `RUNNING` will both be popped sequentially: the first one transitions into `RUNNING`, then the second is checked against it on the inner-loop's next iteration. This is correct because dispatch is sequential within one Step A pass — there is no point at which two `READY` tasks become `RUNNING` simultaneously.
 
+### P2.5 — M5 stuck-exit recovery
+
+Step B step 4's stuck sub-classifier routes here when the broker's recent-closures buffer reports `status == "stuck"` for the worker's branch. `/ccx:loop` Phase 2 Step B stuck-finding detection fires when the same finding `(file, title, body)` key recurs across three consecutive Codex review cycles — the worker has tried twice to satisfy Codex and failed, so continuing to spin is unlikely to help. The supervisor's job here is to capture one chance at human-provided guidance, fold it into the brief's `## Decisions` section, and re-dispatch exactly once. A second stuck exit on the same task is terminal: `stuck-exhausted`, no human prompt, move on.
+
+Every step below runs synchronously inside Step B's per-task drain loop — the scheduling loop blocks on the `AskUserQuestion` call in step 2, which is acceptable because (a) the M5 path is rare compared to the happy path, (b) other `RUNNING` workers keep executing as subprocesses while the supervisor is waiting for a human reply, and (c) the broker's own auto-escalate timer (60s default) is the safety net for any peer worker that emits a `chat_ask` during the wait.
+
+**Algorithm:**
+
+1. **Attempt-cap check.** If `meta.attempts >= STUCK_REDISPATCH_CAP` (default 2), the task has already consumed its one re-dispatch:
+   - Append `<task_id>` to `BLOCKED_IDS`.
+   - Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "stuck-exhausted"`, `notes: "stuck after <meta.attempts> attempts — inspect .ccx/workers/<task_id>.log and revise brief Decisions manually, then re-run supervisor"`.
+   - Write an audit entry with `decision: "stuck-exhausted"`, `source: "attempt-cap"`, `citation: null`, `reply: null`, `brokerOk: null` (the stuck-* audit records reuse the Step B2 JSONL schema; see "Audit entries" below).
+   - Remove `<task_id>` from `RUNNING`. Continue the outer Step B drain loop — other tasks still need classification.
+
+2. **Tail the worker log for stuck-finding details** (best-effort input to the human prompt). Read the last ~200 lines of `.ccx/workers/<task_id>.log`. Extract any lines whose content references "stuck" (case-insensitive) or the finding tuple — `/ccx:loop`'s stuck report is freeform Claude-generated prose, so the supervisor does NOT attempt structured parsing. The tailed excerpt is plumbed verbatim into the AskUserQuestion prompt so the human sees what Codex kept flagging. If the log is unreadable (rare — it was being written to by the worker moments ago), substitute the literal string `(log unavailable — inspect .ccx/workers/<task_id>.log manually)` and proceed; the human can still decide without machine-extracted context.
+
+3. **Also read the brief's current `## Decisions` section** from `REPO_ROOT/.ccx/tasks/<task_id>.md`. Include the section body (max first 1500 chars) in the prompt so the human sees what was already seeded before adding another entry.
+
+4. **Ask the human** via a single `AskUserQuestion`. `AskUserQuestion` always exposes an "Other" free-text response alongside the labeled options, so the supervisor encodes the three logical outcomes (unchanged re-dispatch, abort, guidance-based re-dispatch) as two labeled options plus the "Other" free-text path. That avoids a two-step flow where a second question only exists to collect free text.
+
+   - Question (single line): `Worker T-<id> exited via stuck-finding detection (attempt <meta.attempts> of <STUCK_REDISPATCH_CAP>). Pick an option below, OR select "Other" and paste guidance text to re-dispatch with a new Decisions entry.`
+   - Include in the question body (via the question string itself — `AskUserQuestion` has no separate body field, so append context after a blank line): task title, log path, stuck excerpt from step 2, current Decisions section from step 3.
+   - Two labeled options:
+     1. **Re-dispatch without changes** — rare, but useful if the human believes the stuck was transient (e.g. Codex flakiness) and wants the same brief re-run.
+     2. **Abort (mark blocked)** — give up on this task.
+   - The free-text "Other" path is how the human supplies re-dispatch guidance: whatever they type becomes `guidance_text`.
+   - `AskUserQuestion`'s response carries both the selected option label and any "Other" notes; the supervisor dispatches on the label first, then treats "Other" + non-empty free text as the guidance path. Empty/whitespace-only "Other" text is explicitly NOT treated as re-dispatch without changes — an empty guidance entry would silently waste the task's one re-dispatch by producing a brief revision with no new information; instead, empty "Other" is re-interpreted as abort (see step 5).
+   - If `CHAT_SESSION_ID` is set for the supervisor session (stretch — supervisor sessions do not register with the broker in M5 MVP, so this path is currently dormant; kept as a forward hook), `chat_send` the same context to Discord concurrently so a remote watcher can see the decision. M5 MVP does NOT block on a Discord reply — the local `AskUserQuestion` is the authoritative gate.
+
+5. **Branch on the human's answer.**
+
+   - **Labeled option "Re-dispatch without changes":** skip the brief revision in step 6 and go directly to step 7 (cleanup) → step 8 (re-dispatch).
+
+   - **Labeled option "Abort (mark blocked)":**
+     - Append `<task_id>` to `BLOCKED_IDS`.
+     - Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "stuck-aborted"`, `notes: "human aborted after stuck exit — see .ccx/workers/<task_id>.log"`.
+     - Audit: `decision: "stuck-abort"`, `source: "human-ask"`, `citation: null`, `reply: null`, `brokerOk: null`.
+     - Remove from `RUNNING`. Continue the outer Step B drain loop.
+
+   - **"Other" with non-empty free-text guidance:** the free-text response becomes `guidance_text` and flows into step 6.
+
+   - **"Other" with empty or whitespace-only text:** re-interpret as abort. Stash BOARD-row update with `exit_status: "stuck-aborted"`, `notes: "human selected 'Other' for guidance but supplied empty text — treated as abort"`. Audit entry identical to the Abort path above, citation set to the literal string `"(empty-other-ignored)"` so a later auditor can distinguish a deliberate abort from an empty-other reinterpretation. Remove from `RUNNING`. Continue the outer Step B drain loop.
+
+6. **Append the guidance to the brief.** Read `REPO_ROOT/.ccx/tasks/<task_id>.md` and locate the `## Decisions` section. Two cases:
+
+   - **Section contains only the HTML-comment template** (first-time revision): replace the `<!-- ... -->` block with the new entry.
+   - **Section already has `- q:` / `a:` entries** (rare — unused by initial dispatch, but reached if a prior milestone seeded Decisions, or if a task recovered from a `stuck-aborted` state in a previous run that was then manually re-seeded): append the new entry after the last existing one. Preserve prior entries byte-for-byte.
+
+   The new entry:
+
+   ```yaml
+   - q: "Stuck finding on attempt <meta.attempts> — <first 80 chars of stuck excerpt, or 'see worker log'>"
+     a: |
+       <guidance_text, verbatim, indented under the pipe scalar>
+   ```
+
+   Use the YAML `|` block scalar so multi-line guidance preserves formatting. Quote the `q:` string; the `a:` block scalar handles embedded quotes/newlines without escaping. If `guidance_text` ends with a trailing newline, keep it — YAML block scalars preserve final newlines by default.
+
+   Commit the revised brief alone:
+
+   ```bash
+   git add -- ".ccx/tasks/<task_id>.md"
+   git commit -m "supervisor: revise <task_id> brief — M5 stuck recovery (attempt <meta.attempts + 1>)"
+   ```
+
+   If the commit fails (pre-commit hook, signing, etc.), DO NOT proceed with re-dispatch. The brief-revision failure means the integration branch cannot record the revised brief, which means the re-dispatched worker's worktree would fork from a `HEAD` that does NOT contain the guidance — silently wasting the re-dispatch. Instead:
+   - Append `<task_id>` to `BLOCKED_IDS`.
+   - Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "stuck-recovery-failed"`, `notes: "brief revision commit failed: <first 200 chars of git stderr, single-line> — see .ccx/workers/<task_id>.log for original stuck exit"`.
+   - Leave the brief file modified on disk (unstaged or staged — depending on where the hook rejected) so the human can inspect. The next supervisor run's P0 clean-tree check will refuse to start until the human resolves the hook and commits or reverts the edit — the same gate M4's Step D commit-failure recovery relies on.
+   - Audit: `decision: "stuck-recovery-failed"`, `source: "human-ask"`, `citation: <first 200 chars of git stderr>`, `reply: null`, `brokerOk: null`.
+   - Remove from `RUNNING`. Continue the outer Step B drain loop.
+
+7. **Clean the prior worktree and branch.** Before re-spawning, the worker's prior worktree + branch MUST be removed. If left intact, Step A step 1b's stale-artifact gate would fire on the re-dispatch and classify the task as `stale-artifact` blocked — defeating the point of this path. Sequence:
+
+   ```bash
+   git worktree remove --force "<REPO_ROOT>-<task_id>" 2>/dev/null
+   git branch -D "ccx/<task_id>" 2>/dev/null
+   ```
+
+   `--force` is required because `/ccx:loop` in stuck-exit mode does NOT commit its last fix attempt (Phase 4's auto-commit gate blocks on `stuck`), so the worktree may hold uncommitted edits. Those edits are intentionally discarded — they failed Codex review and are captured in the worker log for human inspection. The branch's commit history is similarly discarded from the branch pointer (`git reflog` still holds it for a while if the human wants to recover it manually).
+
+   Verify cleanup succeeded before continuing:
+
+   ```bash
+   git rev-parse --verify "refs/heads/ccx/<task_id>" 2>/dev/null   # expect non-zero
+   test -e "<REPO_ROOT>-<task_id>"                                 # expect non-zero
+   ```
+
+   If either artifact still exists (permission denied on worktree directory, branch protection blocking deletion, etc.):
+   - Append `<task_id>` to `BLOCKED_IDS`.
+   - Stash BOARD-row update: `status: "blocked"`, `finished_at: "<now>"`, `exit_status: "stuck-cleanup-failed"`, `notes: "worktree or branch cleanup failed — manually remove <REPO_ROOT>-<task_id> and ccx/<task_id>, then re-run supervisor"`.
+   - Audit: `decision: "stuck-cleanup-failed"`, `source: "human-ask"`, `citation: null`, `reply: null`, `brokerOk: null`.
+   - Remove from `RUNNING`. Continue the outer Step B drain loop. Do NOT attempt re-dispatch with stale artifacts in place.
+
+8. **Re-dispatch.** Reuse Step A steps 4–6 verbatim (capture pre-spawn `STARTED_AT`, spawn, verify-live, persist assigned) with two differences:
+   - The `attempts` field in step 6's BOARD update is set to `meta.attempts + 1`, not `1`. Clear `finished_at: null` and `exit_status: null` since this is a fresh attempt.
+   - A fresh `STARTED_AT` is captured pre-spawn per Step A step 4's rule; the BOARD row's `started_at` and `RUNNING[<task_id>].started_at` both receive this new value. Capturing pre-spawn is non-negotiable for re-dispatch too: a re-dispatched worker that hits stuck in <3s would otherwise be classified against a post-spawn `started_at`, again filtering out its own closure.
+   - The dispatch prompt (§P2.2) is re-assembled from the NOW-revised brief file — `wc -c` on the revised brief picks the inline-vs-read-the-file variant per the existing 4KB escape hatch. The prompt embedding always reads the current file content, so the guidance reaches the worker whether inline-embedded or read-on-demand.
+
+9. **Update `RUNNING[<task_id>]` in place.** Overwrite `shell_id`, `log_path` (same path — `.ccx/workers/<task_id>.log` — which means the re-dispatched worker's output appends to the prior attempt's log; keep this behavior so a human reading the log sees both attempts in order), `started_at` (use the new pre-spawn `STARTED_AT` from step 8), and `attempts: meta.attempts + 1`. Keep `worktree_path`, `branch`, and `scope_include` unchanged (same values, recreated paths). Do NOT remove or re-add `<task_id>` to `DISPATCHED` — same task id, same ownership. Advancing `started_at` is load-bearing: §P2.5's classifier on the NEXT exit uses `at >= started_at` to reject the prior attempt's closure record; leaving the first attempt's `started_at` in place would readmit the prior stuck closure into the scoped set and re-trigger recovery redundantly.
+
+10. **Audit the successful re-dispatch.** Write a final JSONL line: `decision: "stuck-recover"`, `source: "human-ask"`, `citation: <first 200 chars of guidance_text or "(no-change re-dispatch)">`, `reply: <JSON.stringify of guidance_text or null>`, `brokerOk: null`. This closes the loop on the stuck → recover audit trail so P3 can report accurate counts.
+
+11. **Do NOT mark the task as merged or blocked.** It remains `status: "assigned"` on the BOARD, and the newly-spawned worker will be processed by Step B on a later iteration exactly like a first-time dispatch. Continue the outer Step B drain loop to classify other `RUNNING` tasks.
+
+**Re-dispatch log continuity.** The re-dispatched worker writes to the same `.ccx/workers/<task_id>.log` file as the prior attempt. Shell redirection with `>` would truncate the file; the supervisor MUST use `>>` for re-dispatch spawns so both attempts' stdout/stderr are preserved in order. Concretely, Step A step 4's spawn command becomes `... >> ".ccx/workers/<task_id>.log" 2>&1` when the dispatch is a re-dispatch (i.e. when called from §P2.5 step 8). First-time dispatch keeps `>` (the log directory was created in P0 and first-time dispatch should not be appending to a file that shouldn't exist yet — a prior run's stale log would silently concatenate).
+
+**Audit entries.** Reuse the Step B2 JSONL schema from `REPO_ROOT/.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl`, with `decision` values extended to include `stuck-recover | stuck-abort | stuck-exhausted | stuck-recovery-failed | stuck-cleanup-failed`. For these entries, the `askId` and `sessionId` fields are `null` (the prompt originated locally from `AskUserQuestion`, not from a worker `chat_ask`), `ageSec` is `0`, `prompt` is the first 200 chars of the stuck excerpt from step 2, `reply` is the guidance text (or null), `brokerOk` is `null`. This keeps all supervisor decisions — M3 autonomous answering plus M5 stuck handling — discoverable by a single `jq '.decision' <SUPERVISOR_RUN_ID>.jsonl` pass.
+
+**What M5 explicitly does NOT do:**
+
+- No automatic brief-Decisions synthesis. M5 always asks the human — the design doc's "revise the brief's Decisions section (from the stuck-finding content)" is deliberately human-mediated because fabricating an answer without judgement was what the worker's own fix attempts already tried and failed.
+- No retry without human input. A stuck exit without a human sitting at the supervisor terminal will block on `AskUserQuestion` until the human returns or cancels the supervisor session. Unlike `/ccx:loop` phase 0.7's chat-bridge fallback pattern, the supervisor session is always interactive by contract, so a missing human is a deploy-time error not a runtime case to handle.
+- No resume of a stuck-recovered worker from where the prior attempt left off. The re-dispatched worker starts `/ccx:loop` Phase 1 from scratch; prior partial fixes live only in the discarded worktree (recoverable via `git reflog` until gc).
+
 ---
 
 ## Phase P3: Report
 
 Print a structured final summary:
 
-- **Merged** (`<count>`): list `T-<id>` — `<title>` — `<duration>`.
-- **Blocked** (`<count>`): list `T-<id>` — `<exit_status>` — log path (`.ccx/workers/T-<id>.log`). Blocked reasons: `stale-artifact | spawn-error | merge-conflict | merge-aborted | merge-commit-failed | no-commit | error`. The two M4-specific reasons:
-  - `merge-aborted`: `git merge --no-commit --no-ff` refused the merge with no unmerged paths (pre-merge-commit hook rejection, branch protection, residual MERGE_HEAD, unreachable object). The supervisor does NOT set `STOP_DISPATCHING` here — failures of this shape are usually per-merge, so the loop keeps draining and other peers can still merge.
-  - `merge-commit-failed`: the pre-merge dry-run reported clean but `git commit --no-edit` rejected the merge (typically a pre-commit hook on the integration branch); the supervisor sets `STOP_DISPATCHING` so no new workers spawn, drains existing `RUNNING` peers via Step B, then exits via condition 3. A recovery sidecar at `.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt` is written when the same condition is likely to break the Step D batch BOARD commit.
+- **Merged** (`<count>`): list `T-<id>` — `<title>` — `<duration>` — `attempts=<N>` (only when `attempts > 1`; omit the `attempts=` suffix for first-attempt merges to keep the common case clean). `attempts > 1` means the task was re-dispatched after a stuck exit and succeeded on a later attempt — worth surfacing so the human knows the M5 recovery earned its keep.
+- **Blocked** (`<count>`): list `T-<id>` — `<exit_status>` — log path (`.ccx/workers/T-<id>.log`) — `attempts=<N>` (suffix only when `N > 1`). Blocked reasons: `stale-artifact | spawn-error | merge-conflict | merge-aborted | merge-commit-failed | no-commit | error | stuck-exhausted | stuck-aborted | stuck-recovery-failed | stuck-cleanup-failed`. M-specific reasons:
+  - `merge-aborted` (M4): `git merge --no-commit --no-ff` refused the merge with no unmerged paths (pre-merge-commit hook rejection, branch protection, residual MERGE_HEAD, unreachable object). The supervisor does NOT set `STOP_DISPATCHING` here — failures of this shape are usually per-merge, so the loop keeps draining and other peers can still merge.
+  - `merge-commit-failed` (M4): the pre-merge dry-run reported clean but `git commit --no-edit` rejected the merge (typically a pre-commit hook on the integration branch); the supervisor sets `STOP_DISPATCHING` so no new workers spawn, drains existing `RUNNING` peers via Step B, then exits via condition 3. A recovery sidecar at `.ccx/supervisor-recovery-<SUPERVISOR_RUN_ID>.txt` is written when the same condition is likely to break the Step D batch BOARD commit.
+  - `stuck-exhausted` (M5): the task hit `STUCK_REDISPATCH_CAP` stuck exits in a single run. No human prompt fired on the final stuck because the cap gate in §P2.5 step 1 short-circuits it. Inspect `.ccx/workers/T-<id>.log` (both attempts' output is concatenated there per §P2.5's log-continuity rule) and revise the brief's `## Decisions` section manually before re-running the supervisor.
+  - `stuck-aborted` (M5): a stuck exit was detected, the human was prompted, and they chose "Abort" (or supplied empty guidance, which the supervisor treats as abort). Log path is the final word; the human already made the call.
+  - `stuck-recovery-failed` (M5): the supervisor tried to commit the revised brief after the human supplied guidance but the commit failed (pre-commit hook, signing, branch protection on `.ccx/tasks/`). The brief file is left modified on disk; P0's clean-tree check on the next run forces the human to resolve before a fresh dispatch.
+  - `stuck-cleanup-failed` (M5): the prior attempt's worktree or branch could not be removed (permission denied, branch protection blocking `-D`). The re-dispatch was NOT attempted because leaving stale artifacts would trip Step A's stale-artifact gate on the next dispatch. Manually remove the artifacts and re-run.
 - **Stranded in `PENDING_POOL`** (informational): tasks whose deps were met but were never dispatched before the loop exited. Report each row with the reason it stayed pending so the human knows what follow-up is needed. Source these reasons from the run-level state (`EVER_DEFERRED_BY_SCOPE`, `STOP_DISPATCHING`, in-memory BOARD `depends_on` resolution) — `DEFERRED_THIS_PASS` is intentionally cleared every A1 pass and is NOT a valid source for P3.
   - `T-<id> — scope-deferred`: `<id>` is in `EVER_DEFERRED_BY_SCOPE`. The M4 scope-overlap gate deferred this task on at least one Step A pass because a `RUNNING` task held an overlapping file set, and no slot ever cleared into a non-overlapping window before the loop exited (typically because `--max-tasks` was reached, `STOP_DISPATCHING` was set, or all conflicting peers merged after this pass's A1 had already moved on). Re-run the supervisor once the conflicting ids merge.
   - `T-<id> — deferred-by-stop-dispatching`: exit condition 3 (M4 — see Step B's merge-commit-failed branch) fired and the loop drained `RUNNING` without dispatching this task. The integration-branch commit pipeline rejected at least one merge commit during the run; resolve the underlying hook/signing/protection issue (see the recovery sidecar referenced below if the run produced one) and re-run the supervisor to pick this task back up.
   - `T-<id> — deps-blocked`: the task's `depends_on` set still points at non-`merged` ids in the in-memory BOARD state at exit. Surface the unmet dep ids; this is the same data the "Not ready (deps unmet)" bullet reports above and is included here for completeness when the same task is also `scope-deferred` or `deferred-by-stop-dispatching`.
 - **Not ready (deps unmet)**: list `T-<id>` with its pending deps.
 - **Still assigned/running** — only non-empty if the loop exited via `--max-tasks` while workers were still running. Step C waits on RUNNING, so this should stay empty; guard against it in the report anyway.
-- **Supervisor audit** (M3 only, when `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` exists and the run is in supervisor mode): parse every JSONL line in that file (no timestamp filter needed — the per-run filename already isolates this run's decisions from any concurrent supervisor) and summarize counts per `decision` (`reply` / `escalate`) and per `source` (`brief` / `direction` / `worker-history` / `none`). Also print the in-memory `foreignAsksSkipped` counter — asks this run observed on the broker but did NOT own (another ccx session or not-yet-attributed); a non-zero value is informational, not a failure. Include the absolute path to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can grep it for deeper auditing. If no asks were handled this run (file absent AND no foreign skips), print `no worker asks this run` and move on — absence is not an error.
+- **Supervisor audit** (M3 + M5 decisions, when `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` exists): parse every JSONL line in that file (no timestamp filter needed — the per-run filename already isolates this run's decisions from any concurrent supervisor) and summarize counts per `decision` and per `source`. M3 decisions use `decision: "reply" | "escalate"` with `source: "brief" | "direction" | "worker-history" | "none"`; M5 decisions use `decision: "stuck-recover" | "stuck-abort" | "stuck-exhausted" | "stuck-recovery-failed" | "stuck-cleanup-failed"` with `source: "human-ask" | "attempt-cap"`. Group the summary by decision family (M3 ask-handling vs M5 stuck recovery) so the human sees both dimensions at a glance. Also print the in-memory `foreignAsksSkipped` counter — asks this run observed on the broker but did NOT own (another ccx session or not-yet-attributed); a non-zero value is informational, not a failure. Include the absolute path to `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` so the human can grep it for deeper auditing. If no asks were handled AND no stuck events fired this run (file absent AND no foreign skips), print `no supervisor decisions this run` and move on — absence is not an error. If the run was in Discord-only mode (no supervisor tool surface), note `M3 Step B2 and M5 stuck recovery disabled — broker not in supervisor mode; worker asks reached Discord via broker's auto-escalate and stuck exits were classified as generic no-commit`.
 
 For each merged task, print the exact cleanup commands so the user can run them when ready:
 
@@ -633,15 +795,16 @@ Print a final BOARD.md snapshot (the `## Tasks` YAML block) so the user can see 
 | Autonomous answering from brief `## Decisions` / BOARD direction / merge history | M3 — shipped |
 | Scope-glob overlap parallelism gate | M4 — shipped |
 | Pre-merge conflict dry-run before committing the merge | M4 — shipped |
-| Stuck-exit auto-revise brief and re-dispatch | M5 |
+| Stuck-exit auto-revise brief and re-dispatch | M5 — shipped |
 | Supervisor resume after session close | open |
 | Worker budget cap tuning (`--worker-loops` default) | §14 of design doc |
 
-Do not add the deferred rows above to this command — they are tracked separately in `docs/supervisor-design.md`. The current contract is: `BOARD.md` → briefs → dispatch (with scope-overlap gate) → poll completions → drain supervisor asks (autonomous reply or escalate) → pre-merge dry-run → BOARD update → audit report.
+Do not add the deferred rows above to this command — they are tracked separately in `docs/supervisor-design.md`. The current contract is: `BOARD.md` → briefs → dispatch (with scope-overlap gate) → poll completions → drain supervisor asks (autonomous reply or escalate) → pre-merge dry-run → stuck-exit auto-revise + re-dispatch (one chance per task) → BOARD update → audit report.
 
-### How M2 / M3 / M4 work together at runtime
+### How M2 / M3 / M4 / M5 work together at runtime
 
 - M2 ships the broker plumbing (`plugins/ccx/mcp/ccx-chat/adapters/supervisor.mjs`, `backend: "supervisor"` config option, and the `chat_supervisor_{poll,reply,escalate,close}` MCP tools). With `backend: "supervisor"` in `~/.claude/ccx-chat/config.json`, worker `chat_ask` calls queue in the broker and auto-escalate to Discord after `supervisor.autoEscalateAfterSec` seconds (default 60).
 - M3 ships the supervisor-side polling (`Step B2`) and the match-confidence rubric (`§P2.3`). When the broker is in Discord-only mode OR the broker tool is unavailable, Step B2 is a no-op and worker asks reach humans via the broker's own 60s auto-escalate timer, preserving the M1 behavior.
 - M4 adds two independent gates that share no state: the scope-overlap gate (`Step A2 step 1a` + `§P2.4`) defers candidate dispatches whose `scope.include` shares any tracked file with a `RUNNING` task's snapshotted `scope_include`, and the pre-merge dry-run (`Step B step 3`) wraps every approved-worker merge in a `git merge --no-commit --no-ff` / `git commit --no-edit` pair so conflict detection happens before commit creation. Neither gate touches the audit log or the broker; both are pure repo-state operations.
-- The audit log (`.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl`) is append-only JSONL, owned by the supervisor session, and committed by the supervisor's Step D batch commit alongside `BOARD.md`. **Add `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` to the Step D staging set** so the run's decisions land on the integration branch atomically with the merge/block outcomes. Never truncate the file; never edit past lines.
+- M5 adds a closure-status ring buffer to the broker (`chat_supervisor_recent_closures`) plus a per-task stuck-recovery algorithm in the supervisor (`Step B step 4` stuck sub-classifier + `§P2.5`). On a worker's `no-commit` exit, the supervisor peels stuck exits out of the generic bucket by querying the ring buffer; first stuck per task triggers a local `AskUserQuestion` prompt, re-dispatch, and BOARD `attempts` increment; second stuck is terminal (`stuck-exhausted`). If the broker is Discord-only or the new MCP tool is unavailable, M5 degrades silently to M4's no-commit-equals-blocked behavior (`M5_DISABLED = true` run-level flag).
+- The audit log (`.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl`) is append-only JSONL, owned by the supervisor session, and committed by the supervisor's Step D batch commit alongside `BOARD.md`. M3 decisions (`decision: "reply" | "escalate"`) and M5 decisions (`decision: "stuck-recover" | "stuck-abort" | "stuck-exhausted" | "stuck-recovery-failed" | "stuck-cleanup-failed"`) share the file and are distinguishable by decision family. **Add `.ccx/supervisor-audit/<SUPERVISOR_RUN_ID>.jsonl` to the Step D staging set** so the run's decisions land on the integration branch atomically with the merge/block outcomes. Never truncate the file; never edit past lines.
