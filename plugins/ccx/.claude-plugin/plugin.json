@@ -1,7 +1,7 @@
 {
   "name": "ccx",
-  "version": "0.3.1",
-  "description": "Automated dev loops with Codex review gates. Provides /ccx:loop, /ccx:forever, /ccx:supervisor (M1 dispatch-only orchestrator), and an optional Discord chat bridge (/ccx:chat-setup + --chat).",
+  "version": "0.3.2",
+  "description": "Automated dev loops with Codex review gates. Provides /ccx:loop, /ccx:forever, /ccx:supervisor (parallel worker orchestrator with autonomous chat_ask answering, scope-overlap gating, and stuck-exit auto-revise), and an optional Discord chat bridge (/ccx:chat-setup + --chat).",
   "author": {
     "name": "Will Kang"
   },
