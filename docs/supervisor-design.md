@@ -437,42 +437,36 @@ Status: proposed (2026-04-18). Driven by the observation that after M1–M5 ship
 
 ### 14.1 Problem
 
-- `BOARD.md` schema lives in §5 of this design doc and inside `plugins/ccx/commands/supervisor.md` §P1. The plugin ships no `BOARD.md.example`, no `--init` scaffolder, no error-message pointer.
+- `BOARD.md` schema lives in §5 of this design doc and inside `plugins/ccx/commands/supervisor.md` §P1. The plugin ships no `BOARD.md.example`, no error-message pointer — a first-time user hits `/ccx:supervisor`, sees a parse failure, and has no idea where to look.
 - Even with a template, the human shouldn't *have to* think in YAML rows (`scope.include`, `depends_on`, `attempts`, `worker_pid`). They should be able to describe intent in the format they already prefer — a prompt, a PRD, a ticket export, a CLAUDE.md-style note — and get a reviewable draft back.
 - Most of those fields (`attempts`, `worker_pid`, `started_at`, `exit_status`, `worktree`, `branch`) are supervisor-managed anyway. Humans should touch `title`, `scope.include`, `depends_on`, `notes` at most.
 
-### 14.2 Direction (not yet chosen)
+### 14.2 Direction (chosen 2026-04-18)
 
-A **mandatory planning step** before any dispatch ever happens. The planning step is LLM-driven: it reads a prompt or a user-supplied document, explores the repo for grounding, emits a `BOARD.md` draft, and blocks on human review before the supervisor can dispatch anything.
+**Shape A — separate `/ccx:plan` command.** `/ccx:plan <prompt|--from path>` takes free-form input (a prompt string or a reference to a document the user wrote in their own preferred format), explores the repo to ground `scope.include` on actual files, writes a `BOARD.md` draft with all rows as `status: draft`, commits it as `supervisor: plan draft`, prints the diff, stops. Human reviews, edits if needed, flips `draft → pending`, then runs `/ccx:supervisor` as today.
 
-Two shapes are plausible — pick one in M6 design finalisation:
+**Rejected: Shape B (integrated `/ccx:supervisor --plan`).** Conflates LLM creativity (planning) with deterministic scheduling (supervision). The supervisor's deterministic-parser property has been load-bearing for M4/M5's robustness; mixing in a second failure mode class (hallucinated scope, over-decomposition, under-decomposition) would degrade it. Shape A also makes re-plan ergonomic (`/ccx:plan --append`) and keeps `supervisor.md` at its current size instead of doubling it.
 
-- **Shape A — separate `/ccx:plan` command.** `/ccx:plan <prompt|--from path>` writes `BOARD.md` (or appends rows if one exists), commits it as `supervisor: plan draft`, prints the diff, stops. Human reviews/edits, then runs `/ccx:supervisor` as today. Clean contract: planning and orchestration stay separate, each LLM-driven step has its own command surface.
-- **Shape B — integrated into `/ccx:supervisor`.** On invocation, if `BOARD.md` is missing or all rows are `status: draft`, supervisor enters plan mode: prompts for input, writes draft, calls `AskUserQuestion` for Proceed/Edit/Abort, then continues to dispatch. One command, bigger surface. Conflates the LLM-creativity phase with the deterministic-scheduler phase.
+**Rejected: `--init` skeleton scaffold.** An earlier draft proposed `/ccx:supervisor --init` for users who want a blank YAML template to hand-edit. Dropped because `/ccx:plan` covers the same need (run it with a one-line prompt, get a BOARD.md draft, edit from there) without creating a separate hand-authoring path — which was exactly the onboarding cliff M6 is meant to close. "Hand-authored BOARD.md" is still physically possible (the user can edit the file), but it is not an advertised workflow.
 
-Both shapes require the same sub-decisions (§14.3). Shape A is the less-entangled option and preserves the supervisor's deterministic-parser property; Shape B is the shorter UX path but violates the separation of concerns that M4's merge dry-run and M5's AskUserQuestion already blurred.
+**Missing-BOARD error:** when supervisor is invoked and no `BOARD.md` exists, STOP with: `BOARD.md not found. Run /ccx:plan "<prompt>" or /ccx:plan --from <path> to seed tasks.` No auto-invocation — keeps the two commands' contracts clean and forces a human review step.
 
 ### 14.3 Sub-decisions for M6
 
-1. **Input forms accepted.** At minimum:
+1. **Input forms accepted.** Both of:
    - Prompt string: `/ccx:plan "add OAuth2 login flow"` — free-form, LLM does decomposition.
    - Document reference: `/ccx:plan --from docs/prd-oauth.md` — LLM reads the file the user already wrote in the user's preferred format (PRD, design note, Linear export, whatever).
-   Both must coexist. Document reference is the more important one because it respects the user's existing workflow — many teams already write specs, and the plugin shouldn't force a new format.
+   Document reference is the more important one because it respects the user's existing workflow — many teams already write specs, and the plugin shouldn't force a new format.
 
-2. **Scope grounding.** LLM must derive `scope.include` from *actual repo files*, not guesses. Plan step needs tool access to `Glob`, `Grep`, `Read` against the repo at run time. Ungrounded scopes produce M4 gate misfires at dispatch time — worse than no plan.
+2. **Scope grounding.** LLM must derive `scope.include` from *actual repo files*, not guesses. Plan command needs `Glob`, `Grep`, `Read` in its `allowed-tools`. Ungrounded scopes produce M4 gate misfires at dispatch time — worse than no plan.
 
-3. **Review gate shape.**
-   - Option 3a: draft committed as `BOARD.md`, human reviews via `git diff`, edits, commits amendments, re-runs supervisor.
-   - Option 3b: draft written but NOT committed; supervisor/plan command calls `AskUserQuestion` with Proceed/Edit/Abort; on Proceed commits, on Edit opens editor (not trivial in `-p` mode).
-   - Option 3c: introduce `status: draft` alongside `pending`. Plan writes rows as `draft`; supervisor ignores `draft` at dispatch time; human flips `draft → pending` once satisfied. Keeps BOARD single-source-of-truth, no out-of-band state. **Recommended.**
+3. **Review gate via `status: draft`.** Plan writes rows as `status: draft`. Supervisor's P1 validator treats `draft` as non-dispatchable (same exclusion as `assigned | review | merged | blocked`). Human flips `draft → pending` explicitly before running supervisor — this is the review act. Keeps BOARD as the single source of truth, no out-of-band state, and works in both interactive and `-p` modes (no `AskUserQuestion` dependency on a review prompt that couldn't resolve in `-p`).
 
-4. **Mandatory vs optional planning.** User preference as of 2026-04-18: mandatory. Meaning: BOARD.md cannot be authored purely by hand *without* going through `/ccx:plan` at least once. Enforcement mechanism TBD — possibly a hash/provenance field in BOARD front-matter, possibly a soft convention enforced via supervisor pre-check warning.
+4. **Task-ID allocation.** `T-<n>` numeric suffix. Plan appends starting from `max(existing) + 1`. Never reuses IDs even if prior tasks were `blocked` and removed, because brief filenames and branch names are keyed off ID.
 
-5. **Task-ID allocation.** `T-<n>` numeric suffix. Plan appends starting from `max(existing) + 1`. Never reuses IDs even if prior tasks were `blocked` and removed, because brief filenames and branch names are keyed off ID.
+5. **Re-planning an existing BOARD.md.** When the human wants to add tasks to a BOARD that already has some — `/ccx:plan --append <prompt>` vs `/ccx:plan --from new-prd.md`. Plan should never silently modify existing `pending | assigned | review | merged | blocked` rows, only append new `draft` rows at the end of the Tasks block.
 
-6. **Re-planning an existing BOARD.md.** When the human wants to add tasks to a BOARD that already has some — `/ccx:plan --append <prompt>` vs `/ccx:plan --from new-prd.md`. Plan should never silently modify existing `pending`/`assigned`/`merged` rows, only append.
-
-7. **Relation to `--init`.** Shipping a zero-input `/ccx:supervisor --init` alongside M6 is still worthwhile for users who want to start by hand-editing a skeleton. `--init` writes an empty-task skeleton with the Direction placeholder; `/ccx:plan` fills a draft from actual input. Both can coexist.
+6. **Direction-only updates.** If the user wants to update the `## Direction` prose without adding tasks, they edit `BOARD.md` by hand. Plan does not offer a direction-only mode — it's not worth a dedicated flag.
 
 ### 14.4 Why this belongs as M6, not a nice-to-have
 
