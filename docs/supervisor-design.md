@@ -144,7 +144,7 @@ order and when answering worker questions autonomously.
   priority: normal           # low | normal | high
   depends_on: []             # other task ids that must be merged first
   brief: .ccx/tasks/T-12.md  # path to the per-task brief (§6)
-  attempts: 0                # supervisor-managed (M5); starts at 1 on first dispatch, increments on stuck re-dispatch
+  attempts: 0                # supervisor-managed (M5, widened by M7); starts at 1 on first dispatch; increments on every re-dispatch (stuck or cycle-cap) under M7 — see §15.3/§15.4
   worktree: null             # filled in when dispatched
   branch: null
   worker_pid: null
@@ -373,12 +373,14 @@ while pending_tasks_exist() or running:
 - `stuck` / `budget-exhausted` → mark `status: blocked`, post the worker's last cycle summary to Discord, include the Codex findings that tripped stuck detection, human decides (possibly revise the brief's Decisions section and re-dispatch).
 - `aborted` / `error` → mark `status: blocked` with the log path.
 
+> **M7 note (§15 — proposed):** under M7's tier-escalation logic, `stuck` and `cycle-cap` (the M7 label for `budget-exhausted`) are no longer immediate-block outcomes. Instead the supervisor increments `attempts`, picks the next tier (bump on `stuck`, same tier on `cycle-cap`), and re-dispatches until `attempts >= --max-attempts`. Only then — or on an end-of-ladder `stuck` at `opus-max` — does the block + human-escalation path above fire. The merge / aborted / error rows are unchanged by M7.
+
 ---
 
 ## 10. Merge policy
 
 - **Integration branch** defaults to `main` but `--integration=<branch>` can redirect. Supervisor never force-pushes.
-- **Merge mechanism**: `git merge --squash` (pre-M6 §15.1; replaces an earlier `--no-ff` design). Each task lands as exactly one supervisor-authored commit on the integration branch with subject `T-<id>: <title>`. Rationale: `/ccx:loop` Phase 4 already squashes its review-fix cycles into a single commit, so a `--no-ff` merge would only add a tree-empty graph node — pure noise. Squash gives the same audit surface (one commit per task, identifiable by its `T-<id>:` subject) without the extra commit. Conflict detection still happens before commit creation: the supervisor stages the squash, inspects `git ls-files -u`, and either commits (clean) or rolls back via `git restore --staged --worktree .` (conflict). The rollback is guarded by a pre-merge `git status --porcelain` cleanliness assert so the wholesale restore can never destroy unrelated uncommitted changes.
+- **Merge mechanism**: `git merge --squash` (pre-M6 §16.1; replaces an earlier `--no-ff` design). Each task lands as exactly one supervisor-authored commit on the integration branch with subject `T-<id>: <title>`. Rationale: `/ccx:loop` Phase 4 already squashes its review-fix cycles into a single commit, so a `--no-ff` merge would only add a tree-empty graph node — pure noise. Squash gives the same audit surface (one commit per task, identifiable by its `T-<id>:` subject) without the extra commit. Conflict detection still happens before commit creation: the supervisor stages the squash, inspects `git ls-files -u`, and either commits (clean) or rolls back via `git restore --staged --worktree .` (conflict). The rollback is guarded by a pre-merge `git status --porcelain` cleanliness assert so the wholesale restore can never destroy unrelated uncommitted changes.
 - **Worktree cleanup** is deferred to the human. Supervisor reports the `git worktree remove` commands after merge, following `/ccx:loop`'s existing contract (which also leaves worktrees).
 - **Post-merge `BOARD.md` update** is a single commit per batch of merges, not per individual merge, to avoid N+1 commits cluttering history. Commit subject: `supervisor: update board — merged T-12, T-15, T-19, blocked T-9`.
 
@@ -401,11 +403,17 @@ A stricter alternative — `--permission-mode acceptEdits` plus per-repo `.claud
 
 ```
 /ccx:supervisor [--parallel N] [--integration BRANCH] [--max-tasks M] [--dry-run]
+                [--chat]
+                [--max-attempts N] [--worker-loops N] [--start-tier TIER]   # M7, §15
 
 --parallel N        max concurrent workers (default 3, clamp 1..10)
 --integration B     branch to merge into (default main)
 --max-tasks M       stop after M merges even if tasks remain (default unlimited)
 --dry-run           parse BOARD.md, print dispatch plan, do nothing
+--chat              supervisor lifecycle messages to Discord (§16.3)
+--max-attempts N    per-task dispatch budget (default 4; §15.3)
+--worker-loops N    per-worker cycle cap, forwarded as /ccx:loop --loops N (default 3; §15.3)
+--start-tier TIER   first-attempt rung: haiku|sonnet|opus|opus-xhigh|opus-max (default sonnet; §15.3)
 ```
 
 Phases inside `/ccx:supervisor`:
@@ -424,10 +432,11 @@ Phases inside `/ccx:supervisor`:
 3. **M3 — autonomous answering** (shipped 2026-04-17, commit `7e4b8bc`). Supervisor consults the brief's `## Decisions`, BOARD direction, and prior worker commits on the integration branch to answer without escalating. Every decision lands in `.ccx/supervisor-audit/<RUN_ID>.jsonl` for audit.
 4. **M4 — scope conflict detection** (shipped 2026-04-17, commit `573e39c`). Scope glob overlap check gates parallelism via `git ls-files -- <pathspecs>` intersection with literal and prefix fallbacks. Pre-merge conflict dry-run (`git merge --no-commit --no-ff <branch>` then `git commit --no-edit` or `git merge --abort`) separates conflict detection from commit creation. New blocked reasons: `merge-aborted`, `merge-commit-failed` (the latter sets `STOP_DISPATCHING` and drains existing peers via new exit condition 3).
 5. **M5 — stuck recovery** (shipped 2026-04-17). Broker records every `chat_close` status in an in-memory ring buffer (`chat_supervisor_recent_closures` MCP tool, capped at 256 entries). Supervisor Step B peels stuck exits out of the generic `no-commit` bucket by querying the buffer. First stuck per task triggers a single `AskUserQuestion` (three-way: re-dispatch with guidance via "Other", re-dispatch unchanged, abort); on guidance the supervisor appends a `## Decisions` entry, commits the revised brief, cleans the prior worktree+branch, and re-spawns. `STUCK_REDISPATCH_CAP = 2` hard-caps at one re-dispatch; a second stuck blocks as `stuck-exhausted`. New blocked reasons: `stuck-exhausted`, `stuck-aborted`, `stuck-recovery-failed`, `stuck-cleanup-failed`. BOARD rows gain an `attempts` field (optional, normalized to 0).
-6. **Pre-M6 hotfixes** (shipped 2026-04-18; design in §15). Four runtime hotfixes surfaced by the first e2e run land before M6: §15.1 `--squash` merge policy (replaces `--no-ff`, one supervisor-authored commit per task with `T-<id>: <title>` subject); §15.2 Step C adaptive `BashOutput`-watch + 2s-sleep + 30s-cap polling primitive (replaces fixed `sleep 3`, robust to LLM deviation and harness sleep guards); §15.3 supervisor Discord presence via new `--chat` flag (lifecycle `chat_send` for run start / dispatch / merge / block / stuck / end); §15.4 repo basename prefix on every ccx-chat message body (disambiguates concurrent ccx sessions across repos).
+6. **Pre-M6 hotfixes** (shipped 2026-04-18; design in §16). Four runtime hotfixes surfaced by the first e2e run land before M6: §16.1 `--squash` merge policy (replaces `--no-ff`, one supervisor-authored commit per task with `T-<id>: <title>` subject); §16.2 Step C adaptive `BashOutput`-watch + 2s-sleep + 30s-cap polling primitive (replaces fixed `sleep 3`, robust to LLM deviation and harness sleep guards); §16.3 supervisor Discord presence via new `--chat` flag (lifecycle `chat_send` for run start / dispatch / merge / block / stuck / end); §16.4 repo basename prefix on every ccx-chat message body (disambiguates concurrent ccx sessions across repos).
 7. **M6 — planning phase** (proposed 2026-04-18, design in §14). Free-form-input → `BOARD.md` draft, mandatory review gate before dispatch. Closes the last onboarding cliff: M1–M5 assume `BOARD.md` already exists, but today the schema is plugin-internal knowledge and the plugin ships no scaffolding. M6 makes planning the entry path so humans never hand-author YAML.
+8. **M7 — model tier escalation** (proposed 2026-04-22, design in §15). Supervisor escalates the worker model + effort tier on each `stuck` re-dispatch (same tier on `cycle-cap`), following a fixed 5-rung ladder `haiku(medium) → sonnet(medium) → opus(high) → opus(xhigh) → opus(max)`. Adds three flags — `--max-attempts`, `--worker-loops`, `--start-tier` — and makes the "if the loop drags on, escalate to a better model" behaviour automatic. No BOARD schema change; supervisor + docs only.
 
-M1 and M2 are enough to be useful. M3–M5 are runtime quality-of-life. The pre-M6 hotfixes (§15) tighten merge history, fix a Step C deadlock failure mode, and give the supervisor its own Discord voice. M6 is the entry-path fix and is the last blocker for non-author adoption.
+M1 and M2 are enough to be useful. M3–M5 are runtime quality-of-life. The pre-M6 hotfixes (§16) tighten merge history, fix a Step C deadlock failure mode, and give the supervisor its own Discord voice. M6 is the entry-path fix and is the last blocker for non-author adoption. M7 automates stuck-escalation along a fixed model+effort ladder so the human is only asked when the ladder is exhausted.
 
 ---
 
@@ -476,11 +485,145 @@ Every prior milestone (M1–M5) assumed BOARD.md already exists. At this point t
 
 ---
 
-## 15. Pre-M6 hotfixes and follow-ups (from e2e 2026-04-18)
+## 15. M7 — Model tier escalation
+
+Status: proposed 2026-04-22. Source of truth for T-2 to implement against. Complements M5's stuck recovery: instead of asking the human for guidance on every stuck exit, the supervisor first tries the cheaper "re-run the task at a higher model tier" strategy, and only escalates to the human when the ladder is exhausted or the attempts budget runs out.
+
+### 15.1 Motivation
+
+Before M7, every worker ran at whatever model tier the supervisor session happened to be using — the same fixed tier for the docs tweak and the gnarly refactor, the same tier for the first attempt and the re-dispatch after a stuck exit. Two concrete pain points:
+
+- **No per-task control.** Default runs were burning Opus on tasks that haiku or sonnet could have completed, and there was no way to dial effort down without hand-editing every dispatch one-liner. Conversely, when a cheap tier could not finish the work, nothing escalated automatically — the human had to notice the stuck state and re-dispatch with a stronger model.
+- **Effort was an implicit axis.** `claude -p`'s `--effort` knob existed but had never been a supervisor concern. The result was a single operating point per run: one model, one effort, for every task and every retry.
+
+M7 makes both axes — model alias and effort level — explicit supervisor knobs. First-attempt cost can drop (start at `sonnet` or `haiku`), and subsequent attempts automatically escalate when the worker's exit signal says the prior tier could not finish. The resulting behaviour — "if the loop drags on, escalate to a better model" — is what a human watching a stuck worker would have done manually.
+
+### 15.2 The 5-rung ladder
+
+The tier ladder is **fixed** — five rungs in this exact order, no config file, no per-task override (see §15.6 for what M7 explicitly defers). Each rung is a `(model_alias, effort)` pair:
+
+| Rung | Model alias | Effort | Typical use                                                |
+|------|-------------|--------|------------------------------------------------------------|
+| 0    | `haiku`     | medium | Docs tweaks, one-liner fixes, small mechanical changes.    |
+| 1    | `sonnet`    | medium | Default starting tier; most implementation tasks.          |
+| 2    | `opus`      | high   | First escalation for non-trivial logic work.               |
+| 3    | `opus`      | xhigh  | Second escalation when opus/high could not finish.         |
+| 4    | `opus`      | max    | Terminal rung; nothing higher to escalate to.              |
+
+Implementation shape (for T-2 — no code in this SSOT): every `claude -p` worker spawn is built with `--model <alias>` and `--effort <level>` derived from the rung the supervisor currently has this task on. Using the alias rather than a pinned model ID means a future "sonnet-5" or "opus-5" bump in `claude -p` does not require editing this design doc — the alias resolves inside `claude -p` at runtime.
+
+ASCII view of the ladder and its escalation edges (read left-to-right; `stuck` bumps one rung, `cycle-cap` is a self-loop on each rung):
+
+```
+              stuck             stuck              stuck              stuck
+  sonnet/medium ────> opus/high ──────> opus/xhigh ──────> opus/max
+       ▲                  ▲                  ▲                  ▲
+       │ cycle-cap        │ cycle-cap        │ cycle-cap        │ cycle-cap
+       └────── self ──────┘     (each dashed loop is a separate self-edge)
+
+  haiku/medium   — reachable only when --start-tier haiku.
+                  stuck edge: haiku/medium -> sonnet/medium.
+                  cycle-cap edge: haiku/medium -> haiku/medium.
+```
+
+Each `cycle-cap` arc is a self-loop on its own rung — the `└── self ──┘` bus is a drawing convenience, not a shared transition between rungs. Rung 0 (`haiku/medium`) is never reached by escalation; it is a start-tier choice only. Escalation never descends.
+
+### 15.3 New supervisor flags
+
+Three flags land on `/ccx:supervisor`. Defaults are chosen so that running `/ccx:supervisor` with no flags preserves the pre-M7 cost envelope (first attempt at `sonnet`) while unlocking automatic escalation on stuck exits.
+
+- **`--max-attempts N`** (default `4`). Maximum number of worker dispatches per task before the supervisor stops re-dispatching and escalates to the human. Default `4` exactly covers a full ladder climb from the default start tier: `sonnet → opus/high → opus/xhigh → opus/max` (four attempts inclusive). The running count is persisted as BOARD's existing `attempts` field (see §5); **no new BOARD field** — M7 is a supervisor + docs change, not a schema change. M7 **widens** the M5 semantics of `attempts`: under M5 the counter only incremented on `stuck` re-dispatch, but under M7 it increments on **every** re-dispatch — both `stuck` (which also bumps the tier) and `cycle-cap` (which retries the same tier). The §5 BOARD comment is updated to reflect this; implementations must increment on both outcomes or `--max-attempts` cannot bound the same-tier drain case (example (b) in §15.5).
+
+- **`--worker-loops N`** (default `3`). Forwarded verbatim to each worker as `/ccx:loop --loops <N>` — the per-worker review-fix cycle cap. This is an **independent axis** from `--max-attempts`: `--worker-loops` controls how many review-fix cycles a single worker session runs with Codex before giving up inside its own loop; `--max-attempts` controls how many worker sessions the supervisor spawns for a task across tiers. A low `--worker-loops` with a high `--max-attempts` gives you "many short attempts across the ladder"; the opposite gives you "few but thorough attempts per tier".
+
+- **`--start-tier <haiku|sonnet|opus|opus-xhigh|opus-max>`** (default `sonnet`). The rung the first attempt runs at. Subsequent escalations climb from this rung. Tiers below `--start-tier` are unreachable for that task — if the human sets `--start-tier opus`, rungs 0 (`haiku`) and 1 (`sonnet`) are off the ladder for that run and the effective ladder length shrinks to 3 (`opus/high → opus/xhigh → opus/max`). `--start-tier haiku` exercises the full 5-rung ladder; `--start-tier opus-max` is a 1-rung "no escalation available" run where only `cycle-cap` same-tier retries are possible.
+
+### 15.4 Escalation rules — keyed on worker exit signal
+
+The supervisor chooses the next action by reading the worker's `chat_close` exit status (the existing M5 channel) and the task's current tier + `attempts`:
+
+| Worker exit         | `attempts` | Next tier       | Then                                           |
+|---------------------|------------|-----------------|------------------------------------------------|
+| `approved`          | —          | —               | Merge (existing M1 path). Task done.           |
+| `filtered-clean`    | —          | —               | Merge (same path as `approved`).               |
+| `stuck`             | `++`       | current + 1     | Re-dispatch at the next rung.                  |
+| `cycle-cap`         | `++`       | same rung       | Re-dispatch at the same rung.                  |
+| `aborted` / `error` | —          | —               | Block (existing M1 / M5 behaviour).            |
+
+Edges the table elides:
+
+- **`cycle-cap` is the M7 label for `/ccx:loop`'s `budget-exhausted` exit.** `/ccx:loop` Phase 4 closes with `budget-exhausted` when it runs out of cycles without approval and without detecting stuck. M7's escalation logic treats that status as `cycle-cap`; the wire format is unchanged. This relabelling is documentation-internal — the broker's recent-closures ring buffer still records whatever `/ccx:loop` emits.
+
+- **Stuck-vs-cap ambiguity.** With `--worker-loops 3`, a worker can finish all three cycles hitting the same finding — that is simultaneously "stuck" (same finding in 3 consecutive cycles, `/ccx:loop`'s existing detector fires) and "cycle-cap" (loops exhausted). `/ccx:loop` reports the exit as `stuck` in this case. **Stuck takes precedence** so the tier bumps; M7 inherits that choice rather than re-litigating it.
+
+- **End-of-ladder handling (at `opus-max`).** Nothing higher to escalate to:
+  - `stuck` → human escalation via the existing M5 `AskUserQuestion` path (`opus-max` stuck is the literal "ladder exhausted" signal; further automation here would be speculative).
+  - `cycle-cap` → same-rung retry (`opus-max`) until `attempts >= --max-attempts`, at which point block with reason `attempts-exhausted` and escalate.
+
+- **`attempts >= --max-attempts` with no approval.** Regardless of the last exit type, the supervisor stops re-dispatching and escalates to the human. Per-task escalation is bounded by `--max-attempts`, not by ladder length; a small `--max-attempts` against a full ladder means the supervisor never reaches `opus-max`.
+
+- **M5 interaction.** M5's `STUCK_REDISPATCH_CAP` and first-stuck `AskUserQuestion` prompt predate M7 and addressed the same failure mode by asking the human. M7 subsumes the automatic half (re-dispatch at a higher tier, no human prompt) while reusing M5's `AskUserQuestion` fallback at end-of-ladder. `STUCK_REDISPATCH_CAP` is superseded by `--max-attempts`.
+
+### 15.5 Worked examples
+
+All three examples assume `--start-tier sonnet` (default) and `--max-attempts 4` (default) unless noted. Each row is one attempt.
+
+**(a) All-stuck ladder climb — the happy escalation path.**
+
+| Attempt | Tier            | Worker exit | `attempts` | Next action                      |
+|---------|-----------------|-------------|-----------|-----------------------------------|
+| 1       | sonnet/medium   | stuck       | 1         | bump → opus/high                  |
+| 2       | opus/high       | stuck       | 2         | bump → opus/xhigh                 |
+| 3       | opus/xhigh      | stuck       | 3         | bump → opus/max                   |
+| 4       | opus/max        | approved    | —         | **merge**                         |
+
+Four attempts, full ladder climb, ends with merge. Uses the `--max-attempts 4` budget exactly.
+
+**(b) All-cycle-cap same-tier drain — when loops-per-attempt was the bottleneck.**
+
+Same defaults. Worker keeps running out of `--worker-loops` without triggering stuck (different findings each cycle):
+
+| Attempt | Tier            | Worker exit | `attempts` | Next action                           |
+|---------|-----------------|-------------|-----------|----------------------------------------|
+| 1       | sonnet/medium   | cycle-cap   | 1         | same tier → sonnet/medium              |
+| 2       | sonnet/medium   | cycle-cap   | 2         | same tier → sonnet/medium              |
+| 3       | sonnet/medium   | cycle-cap   | 3         | same tier → sonnet/medium              |
+| 4       | sonnet/medium   | cycle-cap   | 4         | **block** — `attempts-exhausted`       |
+
+Four attempts, never leaves `sonnet/medium`. Blocks with `attempts-exhausted`. The human then decides whether to raise `--max-attempts`, raise `--worker-loops`, or move `--start-tier` up.
+
+**(c) Mixed stuck + cap, opus-max cycle-cap drains budget.**
+
+With `--max-attempts 5` so the example can finish its story:
+
+| Attempt | Tier            | Worker exit | `attempts` | Next action                                         |
+|---------|-----------------|-------------|-----------|------------------------------------------------------|
+| 1       | sonnet/medium   | stuck       | 1         | bump → opus/high                                     |
+| 2       | opus/high       | cycle-cap   | 2         | same tier → opus/high                                |
+| 3       | opus/high       | stuck       | 3         | bump → opus/xhigh                                    |
+| 4       | opus/xhigh      | stuck       | 4         | bump → opus/max                                      |
+| 5       | opus/max        | cycle-cap   | 5         | **block** — `attempts-exhausted` at end-of-ladder    |
+
+Illustrates both the stuck-bumps-tier and cap-stays-same-tier paths interacting, and the end-of-ladder cycle-cap behaviour: at `opus-max`, `cycle-cap` does not escalate to the human on its own — it keeps same-tier re-dispatching at `opus-max` until `--max-attempts` runs out, then blocks with `attempts-exhausted`.
+
+### 15.6 Out of scope for M7
+
+Deliberately deferred. Listed here so the reason is captured and not re-debated when a future M8 design picks up the thread:
+
+- **Per-task `model_profile` field in BOARD.** A BOARD row that pre-declares its starting tier or attempts budget. Useful, but it mixes planning concerns into the queue schema and would require a corresponding `/ccx:plan` change; M7 deliberately keeps BOARD untouched (see §5). Candidate for M8 alongside planner updates.
+- **`/ccx:plan` model inference.** Planner-side heuristic that guesses a cheap tier for docs tasks and a richer tier for code tasks. Out of scope because M7's default `sonnet` start already gives cheap tiers a first try before escalating; heuristic inference is a polish pass, not a correctness fix.
+- **`--start-effort` override.** Mirror of `--start-tier` for the effort axis alone. Dropped to keep M7's user-facing surface at three flags; effort is coupled to model in the fixed ladder, so overriding effort independently would make the rung model harder to reason about. Revives as a targeted flag if a concrete pain case shows up.
+- **Dynamic ladder config / re-ordering.** The five rungs are hardcoded in order. No YAML file chooses rungs or swaps their order. Motivated by the same "deterministic supervisor" property M4 and M5 rely on — a config-driven ladder multiplies failure modes (parse error, missing aliases, circular escalation edges) without a clear benefit at this stage.
+
+These are explicit out-of-scopes so a future M8 design has a starting point for the supervisor's knob surface.
+
+---
+
+## 16. Pre-M6 hotfixes and follow-ups (from e2e 2026-04-18)
 
 Items surfaced during the first end-to-end run against `/tmp/ccx-e2e`. Each scoped tightly so they ship independently or batched with M6. Do NOT pick these up until the e2e sandbox is cleaned or rebuilt — the current `/tmp/ccx-e2e/` has a half-merged dispatch that should be wiped before re-testing.
 
-### 15.1 `--squash` merge policy (replaces `--no-ff`) — shipped 2026-04-18
+### 16.1 `--squash` merge policy (replaces `--no-ff`) — shipped 2026-04-18
 
 **Why:** §10 picked `--no-ff` on the assumption workers land multi-commit branches worth preserving as a group. In practice `/ccx:loop`'s Phase 4 squashes cycles into one final commit, so a task branch has exactly one commit — and `--no-ff` adds a parent-only merge commit that carries **zero new tree changes**, just a graph node. With `--squash`, one task = one supervisor-authored commit on integration: cleaner history with the same audit surface.
 
@@ -491,7 +634,7 @@ Items surfaced during the first end-to-end run against `/tmp/ccx-e2e`. Each scop
 - design doc §10 — update policy + rationale.
 - memory M4 note — `--no-ff --no-commit` → `--squash`.
 
-### 15.2 Step C sleep robustness — shipped 2026-04-18 (option B)
+### 16.2 Step C sleep robustness — shipped 2026-04-18 (option B)
 
 **Why:** Spec says `sleep 3`. First e2e run had supervisor-Claude run `sleep 60` instead (LLM deviated from the literal instruction — model inferred "60s is more reasonable when waiting on LLM workers"). Claude Code 2.1.x blocks long standalone leading sleeps, so the scheduling loop hung at Step C and workers' completions were never drained.
 
@@ -501,7 +644,7 @@ Items surfaced during the first end-to-end run against `/tmp/ccx-e2e`. Each scop
 
 Recommend B — it's the same amount of prose to document, more robust to LLM deviation, and measurably reduces wake-ups on quiet iterations.
 
-### 15.3 Supervisor Discord presence — shipped 2026-04-18 (`--chat` flag)
+### 16.3 Supervisor Discord presence — shipped 2026-04-18 (`--chat` flag)
 
 **Why:** Workers post to Discord via their `chat_send` calls, so the user sees worker chatter. Supervisor itself has no Discord route, so from Discord you cannot tell "a supervisor run started in repo X", "it dispatched T-1 and T-2", "T-1 merged / T-2 blocked", or "the run ended with 3 merged". That's the orchestration timeline the user actually wants to watch, and it's entirely missing.
 
@@ -515,7 +658,7 @@ Recommend B — it's the same amount of prose to document, more robust to LLM de
 
 **Mechanism:** Supervisor registers its own ccx-chat session at P0 with a label like `[supervisor] <repo_basename>`. Uses `chat_send` only (no asks, nothing queues). Gated behind a `--chat` flag on `/ccx:supervisor` to mirror worker semantics. When `backend: "supervisor"`, the supervisor's own sends fall through to the Discord fallback — already plumbed in `adapters/supervisor.mjs`.
 
-### 15.4 Repo-name prefix on all ccx-chat messages — shipped 2026-04-18
+### 16.4 Repo-name prefix on all ccx-chat messages — shipped 2026-04-18
 
 **Why:** User runs many concurrent ccx sessions across different repos (`ccx-loop`, `gold-digger-*`, etc.). Current Discord messages carry session label + branch but not the repo. Prefix disambiguates.
 
@@ -529,7 +672,7 @@ Non-goal: re-rendering the branch as a prefix (already in session label, would d
 
 ---
 
-## 16. Open questions
+## 17. Open questions
 
 - **Broker singleton vs supervisor scope.** The broker is global (one per host). Can two simultaneous supervisor sessions coexist? Probably not on MVP — require one supervisor at a time, enforce with a lock file.
 - **What if the human closes the supervisor session mid-run?** Workers keep running (they're independent processes). On resume (`/ccx:supervisor --resume`), re-read `BOARD.md` and reconcile by checking branch HEADs, `.ccx/workers/*.log` tails, and `chat_close` records. Stretch goal.
