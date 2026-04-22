@@ -11,7 +11,7 @@ The plugin ships four commands:
 | `/ccx:loop`       | Run a fixed number of review-fix cycles (default 2). |
 | `/ccx:forever`    | Repeat review-fix cycles until Codex approves (safety cap default 100). |
 | `/ccx:plan`       | Seed (or extend with `--append`) `BOARD.md` task rows from a prompt or document — onboarding path for `/ccx:supervisor`. |
-| `/ccx:supervisor` | Dispatch N parallel `/ccx:loop` workers from a shared `BOARD.md` (dispatch + autonomous chat_ask + scope-overlap gate + pre-merge squash + stuck-exit auto-revise). |
+| `/ccx:supervisor` | Dispatch N parallel `/ccx:loop` workers from a shared `BOARD.md` (dispatch + autonomous chat_ask + scope-overlap gate + pre-merge squash + automatic tier escalation across a 5-rung model ladder). |
 
 ## Install
 
@@ -92,21 +92,23 @@ Takes a free-form prompt or a reference to a document the user already wrote (PR
 ### `/ccx:supervisor` — parallel orchestrator
 
 ```
-/ccx:supervisor [--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--chat] [--dry-run]
+/ccx:supervisor [--parallel N] [--integration BRANCH] [--max-tasks M] [--worker-loops N] [--max-attempts N] [--start-tier <alias>] [--chat] [--dry-run]
 ```
 
-Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root. Each task gets its own worktree, brief file (`.ccx/tasks/T-<id>.md`), and a squash merge commit on approval. Worker `chat_ask` calls are intercepted by the broker and answered autonomously from the brief / BOARD direction / merge history when possible; ambiguous asks escalate to Discord.
+Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root. Each task gets its own worktree, brief file (`.ccx/tasks/T-<id>.md`), and a squash merge commit on approval. Worker `chat_ask` calls are intercepted by the broker and answered autonomously from the brief / BOARD direction / merge history when possible; ambiguous asks escalate to Discord. When a worker exits without approval, the supervisor re-dispatches the task automatically along a fixed 5-rung model ladder — `haiku(medium) → sonnet(medium) → opus(high) → opus(xhigh) → opus(max)` — bumping one rung on `stuck` exits and retrying the same rung on `cycle-cap`, until the task merges or the `--max-attempts` budget runs out. A `stuck` exit at the top rung (`opus/max`) is the only remaining human gate.
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--parallel N` | Max concurrent workers (1–10) | 3 |
 | `--integration BRANCH` | Branch merges land on | current branch |
 | `--max-tasks M` | Stop after M merges | unlimited |
-| `--worker-loops N` | `--loops N` passed to each worker (1–20) | 5 |
+| `--worker-loops N` | `--loops N` passed to each worker (1–20) | 3 |
+| `--max-attempts N` | Max automatic worker dispatches per task (tier bumps + same-tier retries). Exempt branch: `opus/max` stuck → human prompt. | 4 |
+| `--start-tier <alias>` | First-attempt rung on the 5-rung ladder: `haiku \| sonnet \| opus \| opus-xhigh \| opus-max` | `sonnet` |
 | `--chat` | Register a supervisor session with the ccx-chat broker and post lifecycle events (dispatch, merge, block, stuck prompt, run end) to Discord | off |
 | `--dry-run` | Print dispatch plan, don't commit or spawn | off |
 
-Milestones shipped: M1 dispatch + naive merge, M2 broker supervisor adapter, M3 autonomous chat_ask answering, M4 scope-overlap gate + pre-merge dry-run, M5 stuck-exit auto-revise + re-dispatch, M6 `/ccx:plan` onboarding (separate command above). See `docs/supervisor-design.md` for the full design.
+Milestones shipped: M1 dispatch + naive merge, M2 broker supervisor adapter, M3 autonomous chat_ask answering, M4 scope-overlap gate + pre-merge dry-run, M5 stuck-exit auto-revise + re-dispatch, M6 `/ccx:plan` onboarding (separate command above), M7 automatic model tier escalation. See `docs/supervisor-design.md` for the full design.
 
 ### Examples
 
