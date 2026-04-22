@@ -108,6 +108,24 @@ Drives N parallel `/ccx:loop` workers from a shared `BOARD.md` at the repo root.
 | `--chat` | Register a supervisor session with the ccx-chat broker and post lifecycle events (dispatch, merge, block, stuck prompt, run end) to Discord | off |
 | `--dry-run` | Print dispatch plan, don't commit or spawn | off |
 
+**Tier escalation.** Every worker spawn is parameterized by a rung on this fixed ladder (no config file, no per-task override):
+
+| Rung | `--model` | `--effort` | Typical use                                            |
+|------|-----------|------------|--------------------------------------------------------|
+| 0    | `haiku`   | `medium`   | Docs tweaks, one-liner fixes, small mechanical changes |
+| 1    | `sonnet`  | `medium`   | Default start-tier; most implementation tasks          |
+| 2    | `opus`    | `high`     | First escalation for non-trivial logic work            |
+| 3    | `opus`    | `xhigh`    | Second escalation when opus/high could not finish      |
+| 4    | `opus`    | `max`      | Terminal rung — nothing higher to escalate to          |
+
+Motion on the ladder is driven by the worker's exit:
+
+- `stuck` (same Codex finding across 3 consecutive cycles) → **one rung up**, `attempts++`, re-dispatch. At rung 4 (`opus/max`), `stuck` falls through to an `AskUserQuestion` human prompt — the only remaining manual gate, exempt from `--max-attempts`.
+- `cycle-cap` (`--worker-loops` exhausted without stuck firing) → **same rung**, `attempts++`, re-dispatch until `attempts >= --max-attempts`, then block as `attempts-exhausted`.
+- `approved` → merge, no re-dispatch.
+
+`--start-tier` chooses the first rung; lower rungs are unreachable for that run. The default `--max-attempts 4` exactly covers a pure stuck climb from `sonnet` → `opus/high` → `opus/xhigh` → `opus/max`, so the top-rung human prompt is reachable without raising the budget. `--start-tier haiku` needs at least `--max-attempts 5` to walk all five rungs on stuck exits.
+
 Milestones shipped: M1 dispatch + naive merge, M2 broker supervisor adapter, M3 autonomous chat_ask answering, M4 scope-overlap gate + pre-merge dry-run, M5 stuck-exit auto-revise + re-dispatch, M6 `/ccx:plan` onboarding (separate command above), M7 automatic model tier escalation. See `docs/supervisor-design.md` for the full design.
 
 ### Examples
