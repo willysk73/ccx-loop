@@ -180,16 +180,16 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - plugins/ccx/.claude-plugin/plugin.json
     exclude: []
-  status: pending
+  status: assigned
   priority: normal
   depends_on:
     - T-2
   brief: .ccx/tasks/T-3.md
-  attempts: 0
-  worktree: null
-  branch: null
+  attempts: 1
+  worktree: "/home/will/Repositories/ccx-loop-T-3"
+  branch: "ccx/T-3"
   worker_pid: null
-  started_at: null
+  started_at: "2026-04-22T23:42:19Z"
   finished_at: null
   exit_status: null
   notes: |
