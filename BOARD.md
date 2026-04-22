@@ -20,7 +20,7 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - docs/supervisor-design.md
     exclude: []
-  status: draft
+  status: pending
   priority: normal
   depends_on: []
   brief: .ccx/tasks/T-1.md
@@ -109,7 +109,7 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - plugins/ccx/commands/supervisor.md
     exclude: []
-  status: draft
+  status: pending
   priority: normal
   depends_on:
     - T-1
@@ -180,7 +180,7 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - plugins/ccx/.claude-plugin/plugin.json
     exclude: []
-  status: draft
+  status: pending
   priority: normal
   depends_on:
     - T-2
