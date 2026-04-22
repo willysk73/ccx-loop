@@ -109,16 +109,16 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - plugins/ccx/commands/supervisor.md
     exclude: []
-  status: pending
+  status: assigned
   priority: normal
   depends_on:
     - T-1
   brief: .ccx/tasks/T-2.md
-  attempts: 0
-  worktree: null
-  branch: null
+  attempts: 1
+  worktree: "/home/will/Repositories/ccx-loop-T-2"
+  branch: "ccx/T-2"
   worker_pid: null
-  started_at: null
+  started_at: "2026-04-22T14:59:40Z"
   finished_at: null
   exit_status: null
   notes: |
