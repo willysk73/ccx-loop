@@ -20,7 +20,7 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - docs/supervisor-design.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on: []
   brief: .ccx/tasks/T-1.md
@@ -29,8 +29,8 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
   branch: "ccx/T-1"
   worker_pid: null
   started_at: "2026-04-22T14:45:28Z"
-  finished_at: null
-  exit_status: null
+  finished_at: "2026-04-22T14:56:57Z"
+  exit_status: approved
   notes: |
     Add a new "## 15. M7 — Model tier escalation" section to
     docs/supervisor-design.md after the existing M6 section (§14),
@@ -109,7 +109,7 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - plugins/ccx/commands/supervisor.md
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on:
     - T-1
@@ -119,8 +119,8 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
   branch: "ccx/T-2"
   worker_pid: null
   started_at: "2026-04-22T14:59:40Z"
-  finished_at: null
-  exit_status: null
+  finished_at: "2026-04-22T15:51:41Z"
+  exit_status: approved
   notes: |
     Implement M7 in plugins/ccx/commands/supervisor.md per the design
     in docs/supervisor-design.md §15 (landed by T-1). Touch points:
@@ -180,7 +180,7 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
     include:
       - plugins/ccx/.claude-plugin/plugin.json
     exclude: []
-  status: assigned
+  status: merged
   priority: normal
   depends_on:
     - T-2
@@ -190,8 +190,8 @@ Design decisions locked in this milestone (referenced by T-1 notes and woven int
   branch: "ccx/T-3"
   worker_pid: null
   started_at: "2026-04-22T23:42:19Z"
-  finished_at: null
-  exit_status: null
+  finished_at: "2026-04-22T23:44:33Z"
+  exit_status: approved
   notes: |
     Bump plugins/ccx/.claude-plugin/plugin.json version from 0.3.3
     to 0.3.4 and extend the `description` field with a short mention
